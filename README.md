@@ -47,9 +47,9 @@ This repository includes an automated release workflow (`.github/workflows/relea
 
 ### 1. Create a CurseForge Project & API Token
 1. Create a new World of Warcraft addon project on [CurseForge Authors Console](https://authors.curseforge.com/).
-2. Copy your **Project ID** from the project overview page and add it to `GearSetHelper.toc`:
+2. The CurseForge **Project ID** (`1791430`) is already configured in `GearSetHelper.toc`:
    ```toc
-   ## X-Curse-Project-ID: YOUR_PROJECT_ID
+   ## X-Curse-Project-ID: 1791430
    ```
 3. Generate a CurseForge API token at [CurseForge API Tokens](https://authors.curseforge.com/account/api-tokens).
 
