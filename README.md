@@ -6,7 +6,8 @@
 
 ## Features
 
-- **Automatic Equipment Change Detection:** Listens for individual gear changes and prompts to update your sets (`Active Set`, `All Sets`, or `Ignore`).
+- **Automatic Equipment Change Detection & Set Picker Dropdown:** Listens for individual gear changes and opens a prompt featuring a dropdown of all your configured equipment sets (pre-selecting your `Active Set`), plus buttons for `Update Set`, `All Sets`, and `Ignore`.
+- **Slot-Only Set Updates:** Updating a non-current set (or `All Sets`) updates **only the newly equipped slot(s)** on those sets without overwriting their other gear slots, then restores your currently worn gear.
 - **Smart Set Swap & Dual-Wield Filtering:** Ignores full equipment set swaps (`EQUIPMENT_SWAP_PENDING` / `EQUIPMENT_SWAP_FINISHED`) and debounces rapid dual-wield, ring, or trinket swaps (`0.25s`) into a single prompt.
 - **Combat Lockdown Safe:** Respects `InCombatLockdown()`. Prompts and equipment set mutations are suppressed during combat and automatically queued until combat ends (`PLAYER_REGEN_ENABLED`).
 - **Zero-Config Persistence:** Remembers your enabled/disabled preference across sessions via `GearSetHelperDB`.
