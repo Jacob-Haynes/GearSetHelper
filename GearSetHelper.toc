@@ -1,8 +1,8 @@
-## Interface: 11508, 11509, 16001, 20505, 20506, 30405, 38002, 40402, 50503, 50504, 120107, 120105, 120100, 110207, 110205, 110200, 110107, 110105, 110100
+## Interface: 16002, 16001, 16000, 11509, 11508, 11507, 20505, 20506, 30405, 38002, 40402, 50503, 50504, 120107, 120105, 120100, 110207, 110205, 110200, 110107, 110105, 110100
 ## Title: GearSetHelper
 ## Notes: Prompts to automatically update existing equipment sets when equipping new gear during leveling.
 ## Author: Jacob Haynes
-## Version: 1.0.2
+## Version: 1.0.3
 ## SavedVariables: GearSetHelperDB
 ## IconTexture: Interface\PaperDollInfoFrame\UI-EquipmentManager-Toggle
 ## Category-enUS: Equipment
