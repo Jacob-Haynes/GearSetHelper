@@ -15,7 +15,7 @@ local queuedForCombat = false
 local lastActiveSetKey = nil
 local hasPrintedLoadMessage = false
 
--- Safe numeric slot fallbacks in case any global constant is missing on a client flavor
+-- Safe numeric slot fallbacks
 local SLOT_HEAD      = INVSLOT_HEAD or 1
 local SLOT_NECK      = INVSLOT_NECK or 2
 local SLOT_SHOULDER  = INVSLOT_SHOULDER or 3
@@ -168,6 +168,15 @@ local function GetBagItemLink(bag, bagSlot)
     return nil
 end
 
+local function GetBagItemID(bag, bagSlot)
+    if C_Container and C_Container.GetContainerItemID then
+        return C_Container.GetContainerItemID(bag, bagSlot)
+    elseif GetContainerItemID then
+        return GetContainerItemID(bag, bagSlot)
+    end
+    return nil
+end
+
 local function PickupBagItem(bag, bagSlot)
     if C_Container and C_Container.PickupContainerItem then
         C_Container.PickupContainerItem(bag, bagSlot)
@@ -208,14 +217,24 @@ local function IsItemEquippedInSlot(itemInfo, slotID)
         return itemInfo.guid == currentGUID
     end
     local currentLink = GetInventoryItemLink("player", slotID)
-    if itemInfo.link and currentLink then
-        return itemInfo.link == currentLink
+    if itemInfo.link and currentLink and itemInfo.link == currentLink then
+        return true
     end
     local currentID = GetInventoryItemID("player", slotID)
-    if itemInfo.itemID and currentID then
-        return itemInfo.itemID == currentID
+    if itemInfo.itemID and currentID and itemInfo.itemID == currentID then
+        return true
     end
     return false
+end
+
+local function AreAllSlotItemsEquipped(slotList, slotItemMap)
+    for _, slotID in ipairs(slotList) do
+        local expected = slotItemMap[slotID]
+        if expected and not IsItemEquippedInSlot(expected, slotID) then
+            return false
+        end
+    end
+    return true
 end
 
 local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID)
@@ -226,6 +245,7 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID)
         return true
     end
 
+    -- Check if the item is currently in another equipment slot (e.g. Ring 1 vs Ring 2)
     if itemInfo.guid then
         for _, otherSlot in ipairs(ALL_EQUIPMENT_SLOTS) do
             if otherSlot ~= targetSlotID and GetEquippedSlotGUID(otherSlot) == itemInfo.guid then
@@ -239,6 +259,7 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID)
     end
 
     local maxBag = NUM_BAG_SLOTS or 4
+    -- 1. Exact GUID match in bags
     if itemInfo.guid then
         for bag = 0, maxBag do
             local numSlots = GetNumBagSlots(bag)
@@ -254,6 +275,7 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID)
         end
     end
 
+    -- 2. Exact itemLink match in bags
     if itemInfo.link then
         for bag = 0, maxBag do
             local numSlots = GetNumBagSlots(bag)
@@ -269,21 +291,78 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID)
         end
     end
 
+    -- 3. ItemID match in bags
+    if itemInfo.itemID then
+        for bag = 0, maxBag do
+            local numSlots = GetNumBagSlots(bag)
+            for bagSlot = 1, numSlots do
+                if GetBagItemID(bag, bagSlot) == itemInfo.itemID then
+                    ClearCursor()
+                    PickupBagItem(bag, bagSlot)
+                    EquipCursorItem(targetSlotID)
+                    ClearCursor()
+                    return true
+                end
+            end
+        end
+    end
+
+    -- 4. Native EquipItemByName fallback
+    if EquipItemByName and (itemInfo.link or itemInfo.itemID) then
+        pcall(EquipItemByName, itemInfo.link or itemInfo.itemID, targetSlotID)
+        return true
+    end
+
     return false
 end
 
+-- Checks whether the player is currently wearing every item of a Blizzard set
+-- (excluding the newly changed slots), so we know for certain if a swap is required.
+local function IsBlizzardSetCurrentlyWornExceptChangedSlots(setID, changedSlotMap)
+    if not C_EquipmentSet or not C_EquipmentSet.GetItemIDs then
+        local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
+        return isEquipped and true or false
+    end
+
+    local ok, itemIDs = pcall(C_EquipmentSet.GetItemIDs, setID)
+    if not ok or type(itemIDs) ~= "table" then
+        local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
+        return isEquipped and true or false
+    end
+
+    local ignoredSlots = nil
+    if C_EquipmentSet.GetIgnoredSlots then
+        local okIgn, ign = pcall(C_EquipmentSet.GetIgnoredSlots, setID)
+        if okIgn and type(ign) == "table" then
+            ignoredSlots = ign
+        end
+    end
+
+    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+        local isChangedSlot = changedSlotMap and changedSlotMap[slotID]
+        local isIgnoredSlot = ignoredSlots and ignoredSlots[slotID]
+        if not isChangedSlot and not isIgnoredSlot then
+            local setItemID = itemIDs[slotID]
+            if setItemID and setItemID > 0 then
+                local wornItemID = GetInventoryItemID("player", slotID)
+                if wornItemID ~= setItemID then
+                    return false
+                end
+            end
+        end
+    end
+
+    return true
+end
+
 -- ============================================================================
--- Unified Equipment Set Providers:
--- Supports:
--- 1. Blizzard `C_EquipmentSet` (Retail & Classic/Forever Equipment Manager)
--- 2. `ItemRack` (`ItemRackUser.Sets`)
--- 3. `Outfitter` (`gOutfitter_Settings.Outfits`)
+-- Unified Equipment Set Providers
 -- ============================================================================
 
 local function GetAllConfiguredSets()
     local sets = {}
 
-    -- 1. Check ItemRack sets (widely used in Classic / WoW Forever)
+    -- 1. Check ItemRack sets
     if type(ItemRackUser) == "table" and type(ItemRackUser.Sets) == "table" then
         local currentSet = ItemRackUser.CurrentSet
         local names = {}
@@ -374,30 +453,44 @@ local function RefreshLastActiveSet()
     end
 end
 
-local function ResolveActiveSetEntry(sets)
+local function ResolveActiveSetEntry(sets, changedSlotMap)
     sets = sets or GetAllConfiguredSets()
     if #sets == 0 then
         return nil
     end
 
-    local bestFallback = nil
-    local bestEquippedCount = -1
-
+    -- 1. Any set explicitly marked isEquipped
     for _, s in ipairs(sets) do
         if s.isEquipped then
             return s
         end
-        if (s.numEquipped or 0) > bestEquippedCount then
-            bestEquippedCount = s.numEquipped or 0
-            bestFallback = s
-        end
     end
 
+    -- 2. The last active set before equipping the new item
     if lastActiveSetKey ~= nil then
         for _, s in ipairs(sets) do
             if s.key == lastActiveSetKey then
                 return s
             end
+        end
+    end
+
+    -- 3. Any Blizzard set whose items match all currently worn non-changed slots
+    if changedSlotMap then
+        for _, s in ipairs(sets) do
+            if s.provider == "blizzard" and IsBlizzardSetCurrentlyWornExceptChangedSlots(s.id, changedSlotMap) then
+                return s
+            end
+        end
+    end
+
+    -- 4. Fallback to highest numEquipped
+    local bestFallback = nil
+    local bestEquippedCount = -1
+    for _, s in ipairs(sets) do
+        if (s.numEquipped or 0) > bestEquippedCount then
+            bestEquippedCount = s.numEquipped or 0
+            bestFallback = s
         end
     end
 
@@ -503,8 +596,84 @@ local function UpdateOutfitterSetSlots(outfit, changedSlotList)
     return true, outfit.Name
 end
 
--- Slot-Only Set Update Pipeline
+-- ============================================================================
+-- Verified Slot-Only Set Update Pipeline
+-- ============================================================================
 local activeSwapCallback = nil
+
+-- Equips `slotItemMap` for `slotList` and polls every 0.1s until the client confirms
+-- the items are actually equipped on the character before invoking `onComplete()`.
+local function EquipSlotsAndWaitUntilVerified(slotList, slotItemMap, onComplete)
+    local attempts = 0
+    local maxAttempts = 25 -- up to 2.5 seconds
+
+    local function AttemptAndVerify()
+        if InCombatLockdown() then
+            onComplete(false)
+            return
+        end
+
+        attempts = attempts + 1
+        if attempts == 1 or attempts % 3 == 0 then
+            for _, slotID in ipairs(slotList) do
+                local expectedItem = slotItemMap[slotID]
+                if expectedItem and not IsItemEquippedInSlot(expectedItem, slotID) then
+                    EquipSnapshottedItemIntoSlot(expectedItem, slotID)
+                end
+            end
+        end
+
+        if AreAllSlotItemsEquipped(slotList, slotItemMap) and not CursorHasItem() then
+            -- Give the client 0.1s after inventory confirmation before saving
+            C_Timer.After(0.1, function()
+                onComplete(true)
+            end)
+            return
+        end
+
+        if attempts >= maxAttempts then
+            ClearCursor()
+            onComplete(false)
+            return
+        end
+
+        C_Timer.After(0.1, AttemptAndVerify)
+    end
+
+    AttemptAndVerify()
+end
+
+-- Equips a Blizzard equipment set and invokes `onEquipped()` once `EQUIPMENT_SWAP_FINISHED`
+-- fires and bag locks settle.
+local function EquipBlizzardSetAndWait(setID, onEquipped)
+    local done = false
+    local timeoutTimer = nil
+
+    local function Complete()
+        if done then
+            return
+        end
+        done = true
+        activeSwapCallback = nil
+        if timeoutTimer then
+            timeoutTimer:Cancel()
+            timeoutTimer = nil
+        end
+        -- Wait 0.2s after EQUIPMENT_SWAP_FINISHED so bag item locks clear
+        C_Timer.After(0.2, onEquipped)
+    end
+
+    -- Check if the set is already marked equipped
+    local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
+    if isEquipped then
+        C_Timer.After(0.05, Complete)
+        return
+    end
+
+    activeSwapCallback = Complete
+    timeoutTimer = C_Timer.NewTimer(2.0, Complete)
+    C_EquipmentSet.UseEquipmentSet(setID)
+end
 
 local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlotMap, summaryMode)
     if InCombatLockdown() then
@@ -516,7 +685,7 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
     end
 
     local allSets = GetAllConfiguredSets()
-    local activeEntry = ResolveActiveSetEntry(allSets)
+    local activeEntry = ResolveActiveSetEntry(allSets, changedSlotMap)
     local currentActiveKey = activeEntry and activeEntry.key or nil
 
     local originalWornGear = SnapshotAllWornGear()
@@ -529,7 +698,7 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
     local updatedNames = {}
     local blizzardNonActiveQueue = {}
     local updatedActiveBlizzardSet = false
-    local activeBlizzardSetID = nil
+    local activeBlizzardSetID = (activeEntry and activeEntry.provider == "blizzard") and activeEntry.id or nil
 
     for _, entry in ipairs(targetEntries) do
         if entry.provider == "itemrack" then
@@ -543,12 +712,15 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
                 table.insert(updatedNames, name)
             end
         elseif entry.provider == "blizzard" then
-            if #changedSlotList == 0 or (currentActiveKey and entry.key == currentActiveKey) then
+            local isAlreadyWorn = (#changedSlotList == 0)
+                or IsBlizzardSetCurrentlyWornExceptChangedSlots(entry.id, changedSlotMap)
+            if isAlreadyWorn then
                 local ok, name = SaveBlizzardSetPreservingIgnoredSlots(entry.id, changedSlotMap)
                 if ok then
                     table.insert(updatedNames, name)
-                    updatedActiveBlizzardSet = true
-                    activeBlizzardSetID = entry.id
+                    if activeBlizzardSetID and entry.id == activeBlizzardSetID then
+                        updatedActiveBlizzardSet = true
+                    end
                     lastActiveSetKey = entry.key
                 end
             else
@@ -557,7 +729,7 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
         end
     end
 
-    -- If there are no non-active Blizzard sets requiring a temporary swap, finish right away!
+    -- If no non-active Blizzard sets need swapping, we are done immediately!
     if #blizzardNonActiveQueue == 0 then
         isInternalOperation = false
         local count = #updatedNames
@@ -574,21 +746,8 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
     local function FinishAndRestoreOriginalGear()
         activeSwapCallback = nil
 
-        if updatedActiveBlizzardSet and activeBlizzardSetID then
-            C_EquipmentSet.UseEquipmentSet(activeBlizzardSetID)
-        end
-
-        C_Timer.After(0.15, function()
-            if not InCombatLockdown() then
-                for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
-                    local origItem = originalWornGear[slotID]
-                    if origItem then
-                        EquipSnapshottedItemIntoSlot(origItem, slotID)
-                    end
-                end
-            end
-
-            C_Timer.After(0.15, function()
+        local function FinalizeRestore()
+            EquipSlotsAndWaitUntilVerified(ALL_EQUIPMENT_SLOTS, originalWornGear, function()
                 isInternalOperation = false
                 if currentActiveKey then
                     lastActiveSetKey = currentActiveKey
@@ -605,7 +764,13 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
                     PrintMessage(string.format("Updated %d sets.", count))
                 end
             end)
-        end)
+        end
+
+        if activeBlizzardSetID then
+            EquipBlizzardSetAndWait(activeBlizzardSetID, FinalizeRestore)
+        else
+            FinalizeRestore()
+        end
     end
 
     local function ProcessNextNonActiveSet()
@@ -630,52 +795,39 @@ local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlot
             return
         end
 
-        local stepHandled = false
-        local function OnTargetSetEquipped()
-            if stepHandled then
-                return
-            end
-            stepHandled = true
-            activeSwapCallback = nil
-
+        -- 1. Equip the target non-active set and wait untilEQUIPMENT_SWAP_FINISHED + bag lock settle
+        EquipBlizzardSetAndWait(targetSetID, function()
             if InCombatLockdown() then
                 isInternalOperation = false
                 return
             end
 
-            for _, slotID in ipairs(changedSlotList) do
-                local newItem = newSlotItems[slotID]
-                if newItem then
-                    EquipSnapshottedItemIntoSlot(newItem, slotID)
-                end
-            end
-
-            C_Timer.After(0.15, function()
+            -- 2. Equip ONLY the newly changed slot(s) and wait until GetInventoryItemID/GUID confirms they are worn
+            EquipSlotsAndWaitUntilVerified(changedSlotList, newSlotItems, function()
                 if not InCombatLockdown() then
+                    -- 3. Save the target set now that it has its own gear + the new item equipped
                     local ok, savedName = SaveBlizzardSetPreservingIgnoredSlots(targetSetID, changedSlotMap)
                     if ok then
                         table.insert(updatedNames, savedName)
                     end
                 end
-                ProcessNextNonActiveSet()
+                -- 4. Wait 0.25s for the set save to commit before moving to the next set or restoring gear
+                C_Timer.After(0.25, ProcessNextNonActiveSet)
             end)
-        end
-
-        activeSwapCallback = OnTargetSetEquipped
-        local swapInitiated = C_EquipmentSet.UseEquipmentSet(targetSetID)
-        C_Timer.After(0.25, function()
-            if not stepHandled or not swapInitiated then
-                OnTargetSetEquipped()
-            end
         end)
     end
 
-    ProcessNextNonActiveSet()
+    -- Wait 0.15s if we just saved the active set before starting the swap queue
+    if updatedActiveBlizzardSet then
+        C_Timer.After(0.15, ProcessNextNonActiveSet)
+    else
+        ProcessNextNonActiveSet()
+    end
 end
 
 local function UpdateSingleSetEntry(entry, changedSlotList, changedSlotMap)
     if not entry then
-        entry = ResolveActiveSetEntry()
+        entry = ResolveActiveSetEntry(nil, changedSlotMap)
     end
     if not entry then
         return
@@ -1007,9 +1159,10 @@ local function ShowUpdatePrompt(isTest)
     end
 
     local slotSummary = FormatChangedSlots()
+    local _, changedSlotMap = CopyChangedSlotList()
     queuedForCombat = false
 
-    local activeEntry = ResolveActiveSetEntry(sets)
+    local activeEntry = ResolveActiveSetEntry(sets, changedSlotMap)
     local f = GetOrCreatePromptFrame()
     f.text:SetText(string.format("Equipped new item in |cffffd100%s|r.\nUpdate only that slot in your gear sets?", slotSummary))
     PopulatePromptDropdown(f, sets, activeEntry)
@@ -1029,7 +1182,7 @@ local function ScheduleDebouncedPrompt()
     end)
 end
 
--- Event frame setup (using pcall so client-specific events never abort loading)
+-- Event frame setup
 local eventFrame = CreateFrame("Frame", "GearSetHelperFrame")
 local EVENTS_TO_REGISTER = {
     "ADDON_LOADED",
@@ -1056,7 +1209,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         end
 
     elseif event == "PLAYER_ENTERING_WORLD" then
-        -- Enable built-in equipment manager CVar on Classic/Forever clients if supported
         if SetCVar then
             pcall(SetCVar, "equipmentManager", "1")
         end
@@ -1105,7 +1257,6 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
 
     elseif event == "PLAYER_EQUIPMENT_CHANGED" then
         local equipmentSlot, hasCurrent = ...
-        -- In some Classic/Forever builds `hasCurrent` can be boolean or 1/nil; check GetInventoryItemID directly as fallback
         local slotHasItem = (hasCurrent == true) or (hasCurrent == 1) or (GetInventoryItemID("player", equipmentSlot) ~= nil)
         if not IsEnabled() or isSwappingSet or isInternalOperation or not slotHasItem then
             return

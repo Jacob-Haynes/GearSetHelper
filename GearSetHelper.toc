@@ -2,7 +2,7 @@
 ## Title: GearSetHelper
 ## Notes: Prompts to automatically update existing equipment sets when equipping new gear during leveling.
 ## Author: Jacob Haynes
-## Version: 1.0.3
+## Version: 1.0.4
 ## SavedVariables: GearSetHelperDB
 ## IconTexture: Interface\PaperDollInfoFrame\UI-EquipmentManager-Toggle
 ## Category-enUS: Equipment
