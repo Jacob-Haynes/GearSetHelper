@@ -1,13 +1,27 @@
 local addonName, ns = ...
 
-local POPUP_KEY = "GEARSET_UPDATE_PROMPT"
-local DEBOUNCE_DELAY = 0.25
 local CHAT_PREFIX = "|cff33ff99[GearSetHelper]|r "
+local DEBOUNCE_DELAY = 0.25
+local SET_SWAP_SLOT_THRESHOLD = 4 -- this many slots changing at once is treated as a set swap
+
+local GetMetadata = (C_AddOns and C_AddOns.GetAddOnMetadata) or GetAddOnMetadata
+local ADDON_VERSION = (GetMetadata and GetMetadata(addonName, "Version")) or "?"
+
+-- Saved settings and their defaults
+local DEFAULTS = {
+    enabled = true,          -- show the update prompt when gear changes
+    skipKnownItems = true,   -- no prompt when the equipped item is already in a saved set
+    showLoadMessage = true,  -- print the "Loaded" line on login
+}
+
+-- Key binding labels (Options -> Key Bindings -> AddOns -> GearSetHelper)
+BINDING_HEADER_GEARSETHELPER = "GearSetHelper"
+BINDING_NAME_GEARSETHELPER_TOGGLE = "Toggle update prompts on/off"
 
 -- State tracking
-local isSwappingSet = false
-local isInternalOperation = false
-local isRefreshingPopup = false
+local isSwappingSet = false       -- a full set swap started by the player is in progress
+local isInternalOperation = false -- GearSetHelper itself is moving gear around
+local operationActive = false     -- a set update pipeline is running
 local debounceTimer = nil
 local pendingSlots = {}
 local pendingSlotOrder = {}
@@ -60,26 +74,16 @@ local SLOT_NAMES = {
 }
 
 local ALL_EQUIPMENT_SLOTS = {
-    SLOT_HEAD,
-    SLOT_NECK,
-    SLOT_SHOULDER,
-    SLOT_BODY,
-    SLOT_CHEST,
-    SLOT_WAIST,
-    SLOT_LEGS,
-    SLOT_FEET,
-    SLOT_WRIST,
-    SLOT_HAND,
-    SLOT_FINGER1,
-    SLOT_FINGER2,
-    SLOT_TRINKET1,
-    SLOT_TRINKET2,
-    SLOT_BACK,
-    SLOT_MAINHAND,
-    SLOT_OFFHAND,
-    SLOT_RANGED,
-    SLOT_TABARD,
+    SLOT_HEAD, SLOT_NECK, SLOT_SHOULDER, SLOT_BODY, SLOT_CHEST, SLOT_WAIST,
+    SLOT_LEGS, SLOT_FEET, SLOT_WRIST, SLOT_HAND, SLOT_FINGER1, SLOT_FINGER2,
+    SLOT_TRINKET1, SLOT_TRINKET2, SLOT_BACK, SLOT_MAINHAND, SLOT_OFFHAND,
+    SLOT_RANGED, SLOT_TABARD,
 }
+
+-- Values C_EquipmentSet.GetItemLocations uses for slots that hold no real location
+local LOC_EMPTY   = EQUIPMENT_SET_EMPTY_SLOT or 0
+local LOC_IGNORED = EQUIPMENT_SET_IGNORED_SLOT or 1
+local LOC_MISSING = EQUIPMENT_SET_ITEM_MISSING or -1
 
 local function PrintMessage(msg)
     if DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.AddMessage then
@@ -89,9 +93,41 @@ local function PrintMessage(msg)
     end
 end
 
-local function IsEnabled()
-    return GearSetHelperDB and GearSetHelperDB.enabled ~= false
+local function SlotName(slotID)
+    return SLOT_NAMES[slotID] or ("Slot " .. tostring(slotID))
 end
+
+-- ============================================================================
+-- Settings
+-- ============================================================================
+
+local function InitDB()
+    GearSetHelperDB = GearSetHelperDB or {}
+    for key, value in pairs(DEFAULTS) do
+        if GearSetHelperDB[key] == nil then
+            GearSetHelperDB[key] = value
+        end
+    end
+end
+
+local function GetSetting(key)
+    if not GearSetHelperDB then
+        return DEFAULTS[key]
+    end
+    local value = GearSetHelperDB[key]
+    if value == nil then
+        return DEFAULTS[key]
+    end
+    return value
+end
+
+local function IsEnabled()
+    return GetSetting("enabled") ~= false
+end
+
+-- ============================================================================
+-- Pending slot tracking
+-- ============================================================================
 
 local function ClearPendingSlots()
     wipe(pendingSlots)
@@ -99,18 +135,14 @@ local function ClearPendingSlots()
 end
 
 local function RecordChangedSlot(slotID)
-    if not slotID then
-        return
-    end
-    if not pendingSlots[slotID] then
+    if slotID and not pendingSlots[slotID] then
         pendingSlots[slotID] = true
         table.insert(pendingSlotOrder, slotID)
     end
 end
 
 local function CopyChangedSlotList()
-    local list = {}
-    local map = {}
+    local list, map = {}, {}
     for _, slotID in ipairs(pendingSlotOrder) do
         table.insert(list, slotID)
         map[slotID] = true
@@ -121,7 +153,7 @@ end
 local function FormatChangedSlots()
     local names = {}
     for _, slotID in ipairs(pendingSlotOrder) do
-        table.insert(names, SLOT_NAMES[slotID] or ("Slot " .. tostring(slotID)))
+        table.insert(names, SlotName(slotID))
     end
     if #names == 0 then
         return "Equipment"
@@ -188,6 +220,15 @@ local function PickupBagItem(bag, bagSlot)
     end
 end
 
+local function BagToInventoryID(bag)
+    if C_Container and C_Container.ContainerIDToInventoryID then
+        return C_Container.ContainerIDToInventoryID(bag)
+    elseif ContainerIDToInventoryID then
+        return ContainerIDToInventoryID(bag)
+    end
+    return nil
+end
+
 local function AnyEquippedSlotLocked()
     if not IsInventoryItemLocked then
         return false
@@ -207,12 +248,7 @@ local function SnapshotSlotItem(slotID)
     if not link and not itemID and not guid then
         return nil
     end
-    return {
-        slotID = slotID,
-        link = link,
-        itemID = itemID,
-        guid = guid,
-    }
+    return { slotID = slotID, link = link, itemID = itemID, guid = guid }
 end
 
 local function SnapshotAllWornGear()
@@ -242,29 +278,47 @@ local function IsItemEquippedInSlot(itemInfo, slotID)
     return false
 end
 
-local function DoesCurrentGearMatchSnapshot(snapshot)
+-- With includeEmpty, slots that were empty in the snapshot must also be empty now.
+local function DoesCurrentGearMatchSnapshot(snapshot, includeEmpty)
     for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
         local expected = snapshot[slotID]
-        if expected and not IsItemEquippedInSlot(expected, slotID) then
+        if expected then
+            if not IsItemEquippedInSlot(expected, slotID) then
+                return false
+            end
+        elseif includeEmpty and GetInventoryItemID("player", slotID) ~= nil then
             return false
         end
     end
     return true
 end
 
--- Equips a single snapshotted item into `targetSlotID` using Blizzard's standard
--- PickupContainerItem + PickupInventoryItem pattern (never calling ClearCursor after!).
-local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID, usedBagSlots)
-    if not itemInfo then
-        return true
+local function ListMismatchedSlots(snapshot)
+    local names = {}
+    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+        local expected = snapshot[slotID]
+        local mismatched
+        if expected then
+            mismatched = not IsItemEquippedInSlot(expected, slotID)
+        else
+            mismatched = GetInventoryItemID("player", slotID) ~= nil
+        end
+        if mismatched then
+            table.insert(names, SlotName(slotID))
+        end
     end
-    if IsItemEquippedInSlot(itemInfo, targetSlotID) then
-        return true
-    end
+    return table.concat(names, ", ")
+end
 
+-- Equips one snapshotted item into `targetSlotID`, looking for it first in other
+-- equipment slots, then in bags by GUID, link and itemID.
+local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID, usedBagSlots)
+    if not itemInfo or IsItemEquippedInSlot(itemInfo, targetSlotID) then
+        return true
+    end
     usedBagSlots = usedBagSlots or {}
 
-    -- Check if the item is currently in another equipment slot (e.g. Ring 1 vs Ring 2)
+    -- Already worn in another slot (e.g. Ring 1 vs Ring 2): swap the two slots.
     if itemInfo.guid then
         for _, otherSlot in ipairs(ALL_EQUIPMENT_SLOTS) do
             if otherSlot ~= targetSlotID and GetEquippedSlotGUID(otherSlot) == itemInfo.guid then
@@ -279,52 +333,22 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID, usedBagSlots
     end
 
     local maxBag = NUM_BAG_SLOTS or 4
-
-    -- 1. Exact GUID match in bags
+    local matchers = {}
     if itemInfo.guid then
-        for bag = 0, maxBag do
-            local numSlots = GetNumBagSlots(bag)
-            for bagSlot = 1, numSlots do
-                local key = bag .. ":" .. bagSlot
-                if not usedBagSlots[key] and GetBagSlotGUID(bag, bagSlot) == itemInfo.guid then
-                    usedBagSlots[key] = true
-                    ClearCursor()
-                    PickupBagItem(bag, bagSlot)
-                    if CursorHasItem() then
-                        PickupInventoryItem(targetSlotID)
-                    end
-                    return true
-                end
-            end
-        end
+        table.insert(matchers, function(bag, slot) return GetBagSlotGUID(bag, slot) == itemInfo.guid end)
     end
-
-    -- 2. Exact itemLink match in bags
     if itemInfo.link then
-        for bag = 0, maxBag do
-            local numSlots = GetNumBagSlots(bag)
-            for bagSlot = 1, numSlots do
-                local key = bag .. ":" .. bagSlot
-                if not usedBagSlots[key] and GetBagItemLink(bag, bagSlot) == itemInfo.link then
-                    usedBagSlots[key] = true
-                    ClearCursor()
-                    PickupBagItem(bag, bagSlot)
-                    if CursorHasItem() then
-                        PickupInventoryItem(targetSlotID)
-                    end
-                    return true
-                end
-            end
-        end
+        table.insert(matchers, function(bag, slot) return GetBagItemLink(bag, slot) == itemInfo.link end)
     end
-
-    -- 3. ItemID match in bags
     if itemInfo.itemID then
+        table.insert(matchers, function(bag, slot) return GetBagItemID(bag, slot) == itemInfo.itemID end)
+    end
+
+    for _, matches in ipairs(matchers) do
         for bag = 0, maxBag do
-            local numSlots = GetNumBagSlots(bag)
-            for bagSlot = 1, numSlots do
+            for bagSlot = 1, GetNumBagSlots(bag) do
                 local key = bag .. ":" .. bagSlot
-                if not usedBagSlots[key] and GetBagItemID(bag, bagSlot) == itemInfo.itemID then
+                if not usedBagSlots[key] and matches(bag, bagSlot) then
                     usedBagSlots[key] = true
                     ClearCursor()
                     PickupBagItem(bag, bagSlot)
@@ -337,16 +361,40 @@ local function EquipSnapshottedItemIntoSlot(itemInfo, targetSlotID, usedBagSlots
         end
     end
 
-    -- 4. Native EquipItemByName fallback
-    if EquipItemByName and (itemInfo.link or itemInfo.itemID) then
-        pcall(EquipItemByName, itemInfo.link or itemInfo.itemID, targetSlotID)
+    -- The global EquipItemByName was removed in 12.1.5 (which WoW Forever is built on).
+    local equipByName = (C_Item and C_Item.EquipItemByName) or EquipItemByName
+    if equipByName and (itemInfo.link or itemInfo.itemID) then
+        pcall(equipByName, itemInfo.link or itemInfo.itemID, targetSlotID)
         return true
     end
-
     return false
 end
 
-local function EquipGearSnapshot(snapshot)
+-- Moves whatever is in `slotID` into the first bag with room.
+local function UnequipSlotToBags(slotID)
+    ClearCursor()
+    PickupInventoryItem(slotID)
+    if not CursorHasItem() then
+        return
+    end
+    if PutItemInBackpack then
+        PutItemInBackpack()
+    end
+    for bag = 1, NUM_BAG_SLOTS or 4 do
+        if not CursorHasItem() then
+            return
+        end
+        local invID = BagToInventoryID(bag)
+        if invID and PutItemInBag then
+            PutItemInBag(invID)
+        end
+    end
+    if CursorHasItem() then
+        ClearCursor()
+    end
+end
+
+local function RestoreGearSnapshot(snapshot)
     local usedBagSlots = {}
     for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
         local itemInfo = snapshot[slotID]
@@ -354,193 +402,138 @@ local function EquipGearSnapshot(snapshot)
             EquipSnapshottedItemIntoSlot(itemInfo, slotID, usedBagSlots)
         end
     end
-end
-
--- Unpacks a location value from `C_EquipmentSet.GetItemLocations(setID)` across all WoW versions
-local function UnpackSetItemLocation(location)
-    if not location or location < 0 then
-        return nil
-    end
-
-    if type(EquipmentManager_GetLocationData) == "function" then
-        local ok, data = pcall(EquipmentManager_GetLocationData, location)
-        if ok and type(data) == "table" then
-            return {
-                isPlayer = data.isPlayer or false,
-                isBank   = data.isBank or false,
-                isBags   = data.isBags or false,
-                slot     = data.slot,
-                bag      = data.bag,
-            }
-        end
-    end
-
-    local locPlayer = ITEM_INVENTORY_LOCATION_PLAYER or 0x00100000
-    local locBank   = ITEM_INVENTORY_LOCATION_BANK   or 0x00200000
-    local locBags   = ITEM_INVENTORY_LOCATION_BAGS   or 0x00400000
-    local bagOffset = ITEM_INVENTORY_BAG_BIT_OFFSET  or 8
-
-    local isPlayer = (bit.band(location, locPlayer) ~= 0)
-    local isBank   = (bit.band(location, locBank) ~= 0)
-    local isBags   = (bit.band(location, locBags) ~= 0)
-
-    local slot = location
-    if isPlayer then
-        slot = slot - locPlayer
-    elseif isBank then
-        slot = slot - locBank
-    end
-
-    local bag = nil
-    if isBags then
-        slot = slot - locBags
-        bag = bit.rshift(slot, bagOffset)
-        slot = slot - bit.lshift(bag, bagOffset)
-    end
-
-    return {
-        isPlayer = isPlayer,
-        isBank   = isBank,
-        isBags   = isBags,
-        slot     = slot,
-        bag      = bag,
-    }
-end
-
--- Equips all items belonging to `setID` EXCEPT `changedSlotMap`, keeping `newSlotItems`
--- equipped in `changedSlotMap`. Executed synchronously inside `OnClick` (hardware event)!
-local function EquipBlizzardSetExceptChangedSlots(setID, changedSlotMap, newSlotItems)
-    local usedBagSlots = {}
-
-    -- Ensure the newly equipped item(s) are in their changed slots
-    if newSlotItems then
-        for slotID, itemInfo in pairs(newSlotItems) do
-            if itemInfo and not IsItemEquippedInSlot(itemInfo, slotID) then
-                EquipSnapshottedItemIntoSlot(itemInfo, slotID, usedBagSlots)
-            end
-        end
-    end
-
-    local okLoc, locations = false, nil
-    if C_EquipmentSet.GetItemLocations then
-        okLoc, locations = pcall(C_EquipmentSet.GetItemLocations, setID)
-    end
-
-    local okIDs, itemIDs = false, nil
-    if C_EquipmentSet.GetItemIDs then
-        okIDs, itemIDs = pcall(C_EquipmentSet.GetItemIDs, setID)
-    end
-
-    local ignoredSlots = nil
-    if C_EquipmentSet.GetIgnoredSlots then
-        local okIgn, ign = pcall(C_EquipmentSet.GetIgnoredSlots, setID)
-        if okIgn and type(ign) == "table" then
-            ignoredSlots = ign
-        end
-    end
-
     for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
-        local isChanged = changedSlotMap and changedSlotMap[slotID]
-        local isIgnored = ignoredSlots and ignoredSlots[slotID]
-
-        if not isChanged and not isIgnored then
-            local handled = false
-            local location = (okLoc and type(locations) == "table") and locations[slotID] or nil
-
-            if location and location > 1 then
-                local loc = UnpackSetItemLocation(location)
-                if loc then
-                    if loc.isBags and loc.bag ~= nil and loc.slot ~= nil then
-                        local key = loc.bag .. ":" .. loc.slot
-                        usedBagSlots[key] = true
-                        if EquipmentManager_EquipItemByLocation and EquipmentManager_RunAction then
-                            local okAct, action = pcall(EquipmentManager_EquipItemByLocation, location, slotID)
-                            if okAct and action then
-                                pcall(EquipmentManager_RunAction, action)
-                                handled = true
-                            end
-                        end
-                        if not handled then
-                            ClearCursor()
-                            PickupBagItem(loc.bag, loc.slot)
-                            if CursorHasItem() then
-                                PickupInventoryItem(slotID)
-                                handled = true
-                            end
-                        end
-                    elseif loc.isPlayer and not loc.isBags and loc.slot then
-                        if loc.slot == slotID then
-                            handled = true
-                        else
-                            ClearCursor()
-                            PickupInventoryItem(loc.slot)
-                            if CursorHasItem() then
-                                PickupInventoryItem(slotID)
-                                handled = true
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- Fallback: match by itemID in bags if location unpacking wasn't used
-            if not handled and okIDs and type(itemIDs) == "table" then
-                local targetItemID = itemIDs[slotID]
-                if targetItemID and targetItemID > 0 and GetInventoryItemID("player", slotID) ~= targetItemID then
-                    EquipSnapshottedItemIntoSlot({ itemID = targetItemID }, slotID, usedBagSlots)
-                end
-            end
+        if not snapshot[slotID] and GetInventoryItemID("player", slotID) ~= nil
+            and not (IsInventoryItemLocked and IsInventoryItemLocked(slotID)) then
+            UnequipSlotToBags(slotID)
         end
     end
-end
-
--- Checks whether the player is currently wearing every available item of a Blizzard set
--- (excluding the newly changed slots), so we know if all slots are ready to save.
-local function IsBlizzardSetCurrentlyWornExceptChangedSlots(setID, changedSlotMap)
-    if not C_EquipmentSet or not C_EquipmentSet.GetItemIDs then
-        local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
-        return isEquipped and true or false
-    end
-
-    local ok, itemIDs = pcall(C_EquipmentSet.GetItemIDs, setID)
-    if not ok or type(itemIDs) ~= "table" then
-        local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
-        return isEquipped and true or false
-    end
-
-    local ignoredSlots = nil
-    if C_EquipmentSet.GetIgnoredSlots then
-        local okIgn, ign = pcall(C_EquipmentSet.GetIgnoredSlots, setID)
-        if okIgn and type(ign) == "table" then
-            ignoredSlots = ign
-        end
-    end
-
-    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
-        local isChangedSlot = changedSlotMap and changedSlotMap[slotID]
-        local isIgnoredSlot = ignoredSlots and ignoredSlots[slotID]
-        if not isChangedSlot and not isIgnoredSlot then
-            local setItemID = itemIDs[slotID]
-            if setItemID and setItemID > 0 then
-                local wornItemID = GetInventoryItemID("player", slotID)
-                if wornItemID ~= setItemID then
-                    return false
-                end
-            end
-        end
-    end
-
-    return true
 end
 
 -- ============================================================================
--- Unified Equipment Set Providers
+-- Blizzard Equipment Manager helpers
+-- ============================================================================
+
+local function SafeSetCall(fn, setID)
+    if type(fn) ~= "function" then
+        return nil
+    end
+    local ok, result = pcall(fn, setID)
+    if ok and type(result) == "table" then
+        return result
+    end
+    return nil
+end
+
+-- Returns slotID -> { kind = "item" | "empty" | "ignored" | "missing", itemID = n }
+local function GetBlizzardSetSlotStates(setID)
+    local itemIDs   = SafeSetCall(C_EquipmentSet.GetItemIDs, setID)
+    local locations = SafeSetCall(C_EquipmentSet.GetItemLocations, setID)
+    local ignored   = SafeSetCall(C_EquipmentSet.GetIgnoredSlots, setID)
+
+    local states = {}
+    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+        local itemID = itemIDs and itemIDs[slotID] or nil
+        local location = locations and locations[slotID] or nil
+        if (ignored and ignored[slotID]) or location == LOC_IGNORED then
+            states[slotID] = { kind = "ignored" }
+        elseif location == LOC_MISSING then
+            -- -1 is also used for slots the set can't fill at all; only a real saved
+            -- item counts as missing.
+            if itemID and itemID > 0 then
+                states[slotID] = { kind = "missing", itemID = itemID }
+            else
+                states[slotID] = { kind = "ignored" }
+            end
+        elseif itemID and itemID > 0 then
+            states[slotID] = { kind = "item", itemID = itemID }
+        else
+            states[slotID] = { kind = "empty" }
+        end
+    end
+    return states, itemIDs ~= nil
+end
+
+-- True when every slot of the set (except `changedSlotMap`) is what the player wears.
+-- Strict mode also requires the set's empty slots to be empty and fails on missing items;
+-- it is used to decide whether a set can be saved without swapping any gear.
+local function IsBlizzardSetWornExcept(setID, changedSlotMap, strict)
+    local states, haveItemIDs = GetBlizzardSetSlotStates(setID)
+    if not haveItemIDs then
+        local _, _, _, isEquipped = C_EquipmentSet.GetEquipmentSetInfo(setID)
+        return isEquipped and true or false
+    end
+    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+        if not (changedSlotMap and changedSlotMap[slotID]) then
+            local state = states[slotID]
+            local worn = GetInventoryItemID("player", slotID)
+            if state.kind == "item" then
+                if worn ~= state.itemID then
+                    return false
+                end
+            elseif strict and state.kind == "empty" then
+                if worn ~= nil then
+                    return false
+                end
+            elseif strict and state.kind == "missing" then
+                return false
+            end
+        end
+    end
+    return true
+end
+
+local function GetMissingSetSlots(setID, changedSlotMap)
+    local states = GetBlizzardSetSlotStates(setID)
+    local names = {}
+    for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+        if states[slotID].kind == "missing" and not (changedSlotMap and changedSlotMap[slotID]) then
+            table.insert(names, SlotName(slotID))
+        end
+    end
+    return names
+end
+
+local function UseBlizzardSet(setID)
+    if C_EquipmentSet and C_EquipmentSet.UseEquipmentSet then
+        pcall(C_EquipmentSet.UseEquipmentSet, setID)
+    elseif EquipmentManager_EquipSet then
+        pcall(EquipmentManager_EquipSet, setID)
+    end
+end
+
+-- Saves a Blizzard set from worn gear while keeping its ignored slots ignored, so a
+-- set that deliberately ignores e.g. its trinket slots never picks up a new trinket.
+local function SaveBlizzardSetPreservingIgnoredSlots(setID)
+    local name = C_EquipmentSet.GetEquipmentSetInfo(setID)
+    if not name then
+        return false, nil
+    end
+
+    if C_EquipmentSet.GetIgnoredSlots and C_EquipmentSet.ClearIgnoredSlotsForSave and C_EquipmentSet.IgnoreSlotForSave then
+        local ok, ignoredSlots = pcall(C_EquipmentSet.GetIgnoredSlots, setID)
+        if ok and type(ignoredSlots) == "table" then
+            C_EquipmentSet.ClearIgnoredSlotsForSave()
+            for slot, isIgnored in pairs(ignoredSlots) do
+                if isIgnored then
+                    C_EquipmentSet.IgnoreSlotForSave(slot)
+                end
+            end
+        end
+    end
+
+    C_EquipmentSet.SaveEquipmentSet(setID)
+    return true, name
+end
+
+-- ============================================================================
+-- Unified Equipment Set Providers (ItemRack, Outfitter, Blizzard)
 -- ============================================================================
 
 local function GetAllConfiguredSets()
     local sets = {}
 
-    -- 1. Check ItemRack sets
+    -- 1. ItemRack sets
     if type(ItemRackUser) == "table" and type(ItemRackUser.Sets) == "table" then
         local currentSet = ItemRackUser.CurrentSet
         local names = {}
@@ -571,9 +564,9 @@ local function GetAllConfiguredSets()
         end
     end
 
-    -- 2. Check Outfitter sets
+    -- 2. Outfitter outfits
     if type(gOutfitter_Settings) == "table" and type(gOutfitter_Settings.Outfits) == "table" then
-        for category, outfitList in pairs(gOutfitter_Settings.Outfits) do
+        for _, outfitList in pairs(gOutfitter_Settings.Outfits) do
             if type(outfitList) == "table" then
                 for _, outfit in ipairs(outfitList) do
                     if type(outfit) == "table" and outfit.Name and outfit.Name ~= "" then
@@ -593,7 +586,7 @@ local function GetAllConfiguredSets()
         end
     end
 
-    -- 3. Check Blizzard C_EquipmentSet
+    -- 3. Blizzard Equipment Manager
     if C_EquipmentSet and C_EquipmentSet.GetEquipmentSetIDs then
         local ok, setIDs = pcall(C_EquipmentSet.GetEquipmentSetIDs)
         if ok and type(setIDs) == "table" then
@@ -617,13 +610,54 @@ local function GetAllConfiguredSets()
     return sets
 end
 
-local function RefreshLastActiveSet()
-    local sets = GetAllConfiguredSets()
-    if #sets == 0 then
-        lastActiveSetKey = nil
-        return
+local function ParseItemRackID(value)
+    if value == nil or value == 0 then
+        return nil
     end
-    for _, s in ipairs(sets) do
+    return tonumber(string.match(tostring(value), "^(%d+)"))
+end
+
+-- True when `itemID` is saved in any slot of any configured set.
+local function IsItemInAnySet(itemID, sets)
+    if not itemID then
+        return false
+    end
+    sets = sets or GetAllConfiguredSets()
+    for _, entry in ipairs(sets) do
+        if entry.provider == "blizzard" then
+            local itemIDs = SafeSetCall(C_EquipmentSet.GetItemIDs, entry.id)
+            if itemIDs then
+                for _, id in pairs(itemIDs) do
+                    if id == itemID then
+                        return true
+                    end
+                end
+            end
+        elseif entry.provider == "itemrack" then
+            local setTable = ItemRackUser and ItemRackUser.Sets and ItemRackUser.Sets[entry.id]
+            if type(setTable) == "table" and type(setTable.equip) == "table" then
+                for _, value in pairs(setTable.equip) do
+                    if ParseItemRackID(value) == itemID then
+                        return true
+                    end
+                end
+            end
+        elseif entry.provider == "outfitter" then
+            local items = entry.outfitRef and entry.outfitRef.Items
+            if type(items) == "table" then
+                for _, item in pairs(items) do
+                    if type(item) == "table" and tonumber(item.Code) == itemID then
+                        return true
+                    end
+                end
+            end
+        end
+    end
+    return false
+end
+
+local function RefreshLastActiveSet()
+    for _, s in ipairs(GetAllConfiguredSets()) do
         if s.isEquipped then
             lastActiveSetKey = s.key
             return
@@ -653,48 +687,23 @@ local function ResolveActiveSetEntry(sets, changedSlotMap)
 
     if changedSlotMap then
         for _, s in ipairs(sets) do
-            if s.provider == "blizzard" and IsBlizzardSetCurrentlyWornExceptChangedSlots(s.id, changedSlotMap) then
+            if s.provider == "blizzard" and IsBlizzardSetWornExcept(s.id, changedSlotMap, false) then
                 return s
             end
         end
     end
 
-    local bestFallback = nil
-    local bestEquippedCount = -1
+    local best, bestCount = nil, -1
     for _, s in ipairs(sets) do
-        if (s.numEquipped or 0) > bestEquippedCount then
-            bestEquippedCount = s.numEquipped or 0
-            bestFallback = s
+        if (s.numEquipped or 0) > bestCount then
+            bestCount = s.numEquipped or 0
+            best = s
         end
     end
-
-    return bestFallback or sets[1]
+    return best or sets[1]
 end
 
--- Saves a Blizzard C_EquipmentSet while preserving its ignored slots.
-local function SaveBlizzardSetPreservingIgnoredSlots(setID, changedSlotMap)
-    local name = C_EquipmentSet.GetEquipmentSetInfo(setID)
-    if not name then
-        return false, nil
-    end
-
-    if C_EquipmentSet.GetIgnoredSlots and C_EquipmentSet.ClearIgnoredSlotsForSave and C_EquipmentSet.IgnoreSlotForSave then
-        local ok, ignoredSlots = pcall(C_EquipmentSet.GetIgnoredSlots, setID)
-        if ok and type(ignoredSlots) == "table" then
-            C_EquipmentSet.ClearIgnoredSlotsForSave()
-            for slot, isIgnored in pairs(ignoredSlots) do
-                if isIgnored and not (changedSlotMap and changedSlotMap[slot]) then
-                    C_EquipmentSet.IgnoreSlotForSave(slot)
-                end
-            end
-        end
-    end
-
-    C_EquipmentSet.SaveEquipmentSet(setID)
-    return true, name
-end
-
--- Updates only the changed slot(s) in an ItemRack set directly in `ItemRackUser.Sets`.
+-- Updates only the changed slot(s) of an ItemRack set directly in `ItemRackUser.Sets`.
 local function UpdateItemRackSetSlots(setName, changedSlotList)
     if type(ItemRackUser) ~= "table" or type(ItemRackUser.Sets) ~= "table" then
         return false, nil
@@ -726,39 +735,41 @@ local function UpdateItemRackSetSlots(setName, changedSlotList)
     return true, setName
 end
 
--- Updates only the changed slot(s) in an Outfitter outfit directly.
+local SLOT_TO_OUTFITTER = {
+    [SLOT_HEAD]     = "HeadSlot",
+    [SLOT_NECK]     = "NeckSlot",
+    [SLOT_SHOULDER] = "ShoulderSlot",
+    [SLOT_BODY]     = "ShirtSlot",
+    [SLOT_CHEST]    = "ChestSlot",
+    [SLOT_WAIST]    = "WaistSlot",
+    [SLOT_LEGS]     = "LegsSlot",
+    [SLOT_FEET]     = "FeetSlot",
+    [SLOT_WRIST]    = "WristSlot",
+    [SLOT_HAND]     = "HandsSlot",
+    [SLOT_FINGER1]  = "Finger0Slot",
+    [SLOT_FINGER2]  = "Finger1Slot",
+    [SLOT_TRINKET1] = "Trinket0Slot",
+    [SLOT_TRINKET2] = "Trinket1Slot",
+    [SLOT_BACK]     = "BackSlot",
+    [SLOT_MAINHAND] = "MainHandSlot",
+    [SLOT_OFFHAND]  = "SecondaryHandSlot",
+    [SLOT_RANGED]   = "RangedSlot",
+    [SLOT_TABARD]   = "TabardSlot",
+}
+
+-- Updates only the changed slot(s) of an Outfitter outfit directly.
 local function UpdateOutfitterSetSlots(outfit, changedSlotList)
     if type(outfit) ~= "table" or not outfit.Name then
         return false, nil
     end
     outfit.Items = outfit.Items or {}
-    local SLOT_TO_OUTFITTER = {
-        [SLOT_HEAD]     = "HeadSlot",
-        [SLOT_NECK]     = "NeckSlot",
-        [SLOT_SHOULDER] = "ShoulderSlot",
-        [SLOT_BODY]     = "ShirtSlot",
-        [SLOT_CHEST]    = "ChestSlot",
-        [SLOT_WAIST]    = "WaistSlot",
-        [SLOT_LEGS]     = "LegsSlot",
-        [SLOT_FEET]     = "FeetSlot",
-        [SLOT_WRIST]    = "WristSlot",
-        [SLOT_HAND]     = "HandsSlot",
-        [SLOT_FINGER1]  = "Finger0Slot",
-        [SLOT_FINGER2]  = "Finger1Slot",
-        [SLOT_TRINKET1] = "Trinket0Slot",
-        [SLOT_TRINKET2] = "Trinket1Slot",
-        [SLOT_BACK]     = "BackSlot",
-        [SLOT_MAINHAND] = "MainHandSlot",
-        [SLOT_OFFHAND]  = "SecondaryHandSlot",
-        [SLOT_RANGED]   = "RangedSlot",
-        [SLOT_TABARD]   = "TabardSlot",
-    }
     local slotsToUpdate = (#changedSlotList > 0) and changedSlotList or ALL_EQUIPMENT_SLOTS
     for _, slotID in ipairs(slotsToUpdate) do
         local slotName = SLOT_TO_OUTFITTER[slotID]
         local itemID = GetInventoryItemID("player", slotID)
         if slotName and itemID then
-            local itemName, itemLink = GetItemInfo(itemID)
+            local getInfo = (C_Item and C_Item.GetItemInfo) or GetItemInfo
+            local itemName, itemLink = getInfo(itemID)
             outfit.Items[slotName] = {
                 Code = itemID,
                 SubCode = 0,
@@ -770,285 +781,414 @@ local function UpdateOutfitterSetSlots(outfit, changedSlotList)
     return true, outfit.Name
 end
 
--- Forward declaration for continuation UI when a hardware click is needed
-local ShowHardwareContinuationPrompt
-
 -- ============================================================================
--- Hardware-Safe Slot-Only Set Update Pipeline
+-- Set Update Pipeline
 -- ============================================================================
+--
+-- Blizzard sets can only be saved from what the player is wearing. To change one
+-- slot of a set that is not currently worn we:
+--   1. equip that set (C_EquipmentSet.UseEquipmentSet),
+--   2. put the new item(s) back into the changed slot(s),
+--   3. save the set,
+--   4. repeat for the next set, then put the original gear back on.
+-- Each step waits until the client confirms the swap (no locked slots and the
+-- expected items worn). A set is never saved unless the swap was verified, so a
+-- failed swap skips that set instead of overwriting it with the wrong gear.
 
--- Polls until inventory item locks clear after an `OnClick` swap, then invokes `onReady()`.
-local function WaitForSwapLocksToSettle(targetSetID, changedSlotMap, onReady)
-    local attempts = 0
-    local maxAttempts = 25 -- up to 2.5s
+local operationErrorHandler = nil -- best-effort cleanup for the running operation
+local pendingCombatRestore = nil   -- gear to put back once combat ends
 
-    local function Check()
-        if InCombatLockdown() then
-            onReady(false)
-            return
+local function FinishOperationState(delay)
+    operationErrorHandler = nil
+    -- Late PLAYER_EQUIPMENT_CHANGED events from our own swaps can still arrive; keep
+    -- ignoring them briefly so they do not reopen the prompt.
+    C_Timer.After(delay or 0.5, function()
+        isInternalOperation = false
+        operationActive = false
+        ClearPendingSlots()
+        if debounceTimer then
+            debounceTimer:Cancel()
+            debounceTimer = nil
         end
-        attempts = attempts + 1
-        local locked = AnyEquippedSlotLocked()
-        local worn = IsBlizzardSetCurrentlyWornExceptChangedSlots(targetSetID, changedSlotMap)
-
-        if not locked and (worn or attempts >= 4) then
-            C_Timer.After(0.1, function()
-                onReady(true)
-            end)
-            return
-        end
-
-        if attempts >= maxAttempts then
-            onReady(true)
-            return
-        end
-
-        C_Timer.After(0.1, Check)
-    end
-
-    C_Timer.After(0.15, Check)
+    end)
 end
 
-local function RunSlotOnlySetUpdates(targetEntries, changedSlotList, changedSlotMap, summaryMode)
+-- Wraps a callback so a Lua error can never leave the addon stuck mid-operation.
+local function Guard(fn)
+    return function(...)
+        local ok, err = pcall(fn, ...)
+        if not ok then
+            PrintMessage("|cffff4444Error while updating sets:|r " .. tostring(err))
+            local handler = operationErrorHandler
+            operationErrorHandler = nil
+            if handler then
+                pcall(handler)
+            end
+            -- Longer quiet period: the cleanup's own gear swaps are still landing.
+            FinishOperationState(1.5)
+        end
+    end
+end
+
+-- Polls until `predicate()` holds on two consecutive ticks with no equipment slot
+-- locked, calling `retry()` now and then while waiting. Calls onDone(ok, reason).
+local function WaitFor(predicate, timeout, retry, onDone)
+    local INTERVAL = 0.1
+    local elapsed, sinceRetry, stableTicks = 0, 0, 0
+    local tick
+    tick = Guard(function()
+        if InCombatLockdown() then
+            onDone(false, "combat")
+            return
+        end
+        local busy = AnyEquippedSlotLocked()
+        if not busy and predicate() then
+            stableTicks = stableTicks + 1
+            if stableTicks >= 2 then
+                onDone(true)
+                return
+            end
+        else
+            stableTicks = 0
+        end
+        elapsed = elapsed + INTERVAL
+        sinceRetry = sinceRetry + INTERVAL
+        if elapsed >= timeout then
+            onDone(false, "timeout")
+            return
+        end
+        if retry and not busy and stableTicks == 0 and sinceRetry >= 0.75 then
+            sinceRetry = 0
+            if CursorHasItem() then
+                ClearCursor()
+            end
+            retry()
+        end
+        C_Timer.After(INTERVAL, tick)
+    end)
+    C_Timer.After(INTERVAL, tick)
+end
+
+local function GetItemEquipLoc(itemID)
+    if not itemID then
+        return nil
+    end
+    local getInstant = (C_Item and C_Item.GetItemInfoInstant) or GetItemInfoInstant
+    if getInstant then
+        local _, _, _, equipLoc = getInstant(itemID)
+        return equipLoc
+    end
+    return nil
+end
+
+local function CopySlots(list)
+    local newList, newMap = {}, {}
+    for _, slotID in ipairs(list) do
+        table.insert(newList, slotID)
+        newMap[slotID] = true
+    end
+    return newList, newMap
+end
+
+local function AddSlot(list, map, slotID)
+    if not map[slotID] then
+        map[slotID] = true
+        table.insert(list, slotID)
+    end
+end
+
+-- A two-hander and an off-hand can't be worn together, so changing one weapon slot
+-- can force a change in the other. Returns the slots to update for this set.
+local function ChangedSlotsForSet(states, baseList)
+    local list, map = CopySlots(baseList)
+    -- New two-hander: every set's off-hand must end up empty.
+    if map[SLOT_MAINHAND] and GetItemEquipLoc(GetInventoryItemID("player", SLOT_MAINHAND)) == "INVTYPE_2HWEAPON" then
+        AddSlot(list, map, SLOT_OFFHAND)
+    end
+    -- New off-hand on a set built around a two-hander: it takes your current main hand.
+    if map[SLOT_OFFHAND] and not map[SLOT_MAINHAND] and states then
+        local mainHand = states[SLOT_MAINHAND]
+        if mainHand and mainHand.kind == "item" and GetItemEquipLoc(mainHand.itemID) == "INVTYPE_2HWEAPON" then
+            AddSlot(list, map, SLOT_MAINHAND)
+        end
+    end
+    return list, map
+end
+
+local function AllSlotsIgnored(states, list)
+    for _, slotID in ipairs(list) do
+        if states[slotID].kind ~= "ignored" then
+            return false
+        end
+    end
+    return true
+end
+
+local function RunSetUpdates(targetEntries, changedSlotList, summaryMode)
+    if operationActive then
+        PrintMessage("A set update is already in progress.")
+        return
+    end
     if InCombatLockdown() then
         PrintMessage("Cannot update equipment sets while in combat.")
         return
     end
-    if not targetEntries or #targetEntries == 0 then
+    -- Never treat "no changed slots" as "save everything": that would copy the gear you
+    -- are wearing into every target set.
+    if not targetEntries or #targetEntries == 0 or not changedSlotList or #changedSlotList == 0 then
         return
     end
 
-    local allSets = GetAllConfiguredSets()
-    local activeEntry = ResolveActiveSetEntry(allSets, changedSlotMap)
-    local currentActiveKey = activeEntry and activeEntry.key or nil
+    operationActive = true
+    isInternalOperation = true
 
-    local originalWornGear = SnapshotAllWornGear()
-    local newSlotItems = {}
-    for _, slotID in ipairs(changedSlotList) do
-        newSlotItems[slotID] = originalWornGear[slotID]
+    local _, baseMap = CopySlots(changedSlotList)
+    local activeEntry = ResolveActiveSetEntry(GetAllConfiguredSets(), baseMap)
+    local originalGear = SnapshotAllWornGear()
+
+    local updatedNames = {}
+    local skipped = {}
+    local swapQueue = {}
+
+    operationErrorHandler = function()
+        RestoreGearSnapshot(originalGear)
     end
 
-    isInternalOperation = true
-    local updatedNames = {}
-    local blizzardNonActiveQueue = {}
-
+    -- Sets that can be updated without moving any gear are done straight away.
     for _, entry in ipairs(targetEntries) do
         if entry.provider == "itemrack" then
-            local ok, name = UpdateItemRackSetSlots(entry.id, changedSlotList)
+            local ok, name = UpdateItemRackSetSlots(entry.id, ChangedSlotsForSet(nil, changedSlotList))
             if ok then
                 table.insert(updatedNames, name)
             end
         elseif entry.provider == "outfitter" then
-            local ok, name = UpdateOutfitterSetSlots(entry.outfitRef, changedSlotList)
+            local ok, name = UpdateOutfitterSetSlots(entry.outfitRef, ChangedSlotsForSet(nil, changedSlotList))
             if ok then
                 table.insert(updatedNames, name)
             end
         elseif entry.provider == "blizzard" then
-            local isAlreadyWorn = (#changedSlotList == 0)
-                or IsBlizzardSetCurrentlyWornExceptChangedSlots(entry.id, changedSlotMap)
-            if isAlreadyWorn then
-                local ok, name = SaveBlizzardSetPreservingIgnoredSlots(entry.id, changedSlotMap)
+            local states = GetBlizzardSetSlotStates(entry.id)
+            local list, map = ChangedSlotsForSet(states, changedSlotList)
+            if AllSlotsIgnored(states, list) then
+                table.insert(skipped, { name = entry.name, reason = "the set ignores that slot" })
+            elseif IsBlizzardSetWornExcept(entry.id, map, true) then
+                local ok, name = SaveBlizzardSetPreservingIgnoredSlots(entry.id)
                 if ok then
                     table.insert(updatedNames, name)
-                    lastActiveSetKey = entry.key
                 end
             else
-                table.insert(blizzardNonActiveQueue, entry)
+                table.insert(swapQueue, { entry = entry, list = list, map = map })
             end
         end
     end
 
-    -- If no non-active Blizzard sets need swapping, finish immediately!
-    if #blizzardNonActiveQueue == 0 then
-        isInternalOperation = false
+    local function Finish(aborted)
         local count = #updatedNames
-        if summaryMode == "all" and count > 0 then
-            PrintMessage(string.format("Updated %d %s.", count, count == 1 and "set" or "sets"))
-        elseif count == 1 then
+        if count == 1 and summaryMode ~= "all" then
             PrintMessage(string.format("Updated set %q.", updatedNames[1]))
+        elseif count > 0 then
+            PrintMessage(string.format("Updated %d %s: %s.", count, count == 1 and "set" or "sets", table.concat(updatedNames, ", ")))
         end
-        return
-    end
+        for _, s in ipairs(skipped) do
+            PrintMessage(string.format("|cffffd100Skipped %q|r - %s", s.name, s.reason))
+        end
+        if count == 0 and #skipped == 0 and not aborted then
+            PrintMessage("No sets were updated.")
+        end
 
-    local queueIndex = 0
-
-    local function FinishComplete()
-        isInternalOperation = false
-        if currentActiveKey then
-            lastActiveSetKey = currentActiveKey
-        else
+        if activeEntry then
+            lastActiveSetKey = activeEntry.key
+        end
+        if not aborted then
             RefreshLastActiveSet()
         end
+        FinishOperationState()
+    end
 
-        local count = #updatedNames
-        if summaryMode == "all" then
-            PrintMessage(string.format("Updated %d %s.", count, count == 1 and "set" or "sets"))
-        elseif count == 1 then
-            PrintMessage(string.format("Updated set %q (equipped slot only).", updatedNames[1]))
-        elseif count > 1 then
-            PrintMessage(string.format("Updated %d sets.", count))
+    local function AbortForCombat()
+        PrintMessage("|cffff4444Combat started - set update stopped.|r Your gear will be put back when combat ends.")
+        pendingCombatRestore = originalGear
+        Finish(true)
+    end
+
+    local function Restore()
+        if DoesCurrentGearMatchSnapshot(originalGear, true) then
+            Finish()
+            return
+        end
+        RestoreGearSnapshot(originalGear)
+        WaitFor(
+            function() return DoesCurrentGearMatchSnapshot(originalGear, true) end,
+            6,
+            function() RestoreGearSnapshot(originalGear) end,
+            function(ok, reason)
+                if reason == "combat" then
+                    AbortForCombat()
+                    return
+                end
+                if not ok then
+                    PrintMessage("|cffffd100Could not fully restore your gear|r (" .. ListMismatchedSlots(originalGear) .. "). Re-equip those slots manually.")
+                end
+                Finish()
+            end
+        )
+    end
+
+    -- Puts the original item (or nothing) back into each of `map`'s slots, main hand
+    -- first so a two-hander clears the off-hand before the off-hand is checked.
+    local function EquipNewItems(map)
+        local used = {}
+        for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+            local info = originalGear[slotID]
+            if map[slotID] and info and not IsItemEquippedInSlot(info, slotID) then
+                EquipSnapshottedItemIntoSlot(info, slotID, used)
+            end
+        end
+        for _, slotID in ipairs(ALL_EQUIPMENT_SLOTS) do
+            if map[slotID] and not originalGear[slotID] and GetInventoryItemID("player", slotID) ~= nil
+                and not (IsInventoryItemLocked and IsInventoryItemLocked(slotID)) then
+                UnequipSlotToBags(slotID)
+            end
         end
     end
 
-    local function RestoreOriginalGearStep()
-        if DoesCurrentGearMatchSnapshot(originalWornGear) then
-            FinishComplete()
+    local function NewItemsWorn(map)
+        for slotID in pairs(map) do
+            if not IsItemEquippedInSlot(originalGear[slotID], slotID) then
+                return false
+            end
+        end
+        return true
+    end
+
+    local index = 0
+    local ProcessNext
+    ProcessNext = function()
+        index = index + 1
+        local job = swapQueue[index]
+        if not job then
+            Restore()
+            return
+        end
+        local entry, map = job.entry, job.map
+
+        local missing = GetMissingSetSlots(entry.id, map)
+        if #missing > 0 then
+            table.insert(skipped, { name = entry.name, reason = "items not in your bags: " .. table.concat(missing, ", ") })
+            ProcessNext()
             return
         end
 
-        -- Try restoring automatically first
-        EquipGearSnapshot(originalWornGear)
+        -- Step 1: put the target set on.
+        UseBlizzardSet(entry.id)
+        WaitFor(
+            function() return IsBlizzardSetWornExcept(entry.id, map, true) end,
+            5,
+            function() UseBlizzardSet(entry.id) end,
+            function(ok, reason)
+                if reason == "combat" then
+                    AbortForCombat()
+                    return
+                end
+                if not ok then
+                    table.insert(skipped, { name = entry.name, reason = "could not equip the set (full bags or items in the bank?)" })
+                    ProcessNext()
+                    return
+                end
 
-        C_Timer.After(0.35, function()
-            if DoesCurrentGearMatchSnapshot(originalWornGear) then
-                FinishComplete()
-            else
-                -- Client requires a hardware click to swap back to the original gear
-                local activeName = (activeEntry and activeEntry.name) or "Equipped Gear"
-                ShowHardwareContinuationPrompt(
-                    string.format("Saved %q!\nClick below to switch back to %s:", updatedNames[#updatedNames] or "Set", activeName),
-                    "Restore " .. activeName,
-                    function()
-                        EquipGearSnapshot(originalWornGear)
-                        C_Timer.After(0.25, FinishComplete)
-                    end,
-                    FinishComplete
+                -- Step 2: put the new item(s) back in the changed slot(s), then save.
+                EquipNewItems(map)
+                WaitFor(
+                    function() return NewItemsWorn(map) and IsBlizzardSetWornExcept(entry.id, map, true) end,
+                    5,
+                    function() EquipNewItems(map) end,
+                    function(ok2, reason2)
+                        if reason2 == "combat" then
+                            AbortForCombat()
+                            return
+                        end
+                        if ok2 then
+                            local saved, name = SaveBlizzardSetPreservingIgnoredSlots(entry.id)
+                            if saved then
+                                table.insert(updatedNames, name)
+                            end
+                        else
+                            table.insert(skipped, { name = entry.name, reason = "could not re-equip the new item" })
+                        end
+                        ProcessNext()
+                    end
                 )
             end
-        end)
+        )
     end
 
-    -- Executes inside a hardware event (`OnClick`) to swap into `targetEntry`'s non-changed slots,
-    -- wait for locks to clear, save `targetEntry`, and advance.
-    local function ExecuteNonActiveSetInHardwareEvent(targetEntry)
-        local targetSetID = targetEntry.id
-        local setName = C_EquipmentSet.GetEquipmentSetInfo(targetSetID)
-        if not setName then
-            return
-        end
-
-        -- Synchronously inside `OnClick`: equip all of `targetSetID`'s items EXCEPT `changedSlotMap`,
-        -- leaving the newly equipped item worn in `changedSlotMap`!
-        EquipBlizzardSetExceptChangedSlots(targetSetID, changedSlotMap, newSlotItems)
-
-        WaitForSwapLocksToSettle(targetSetID, changedSlotMap, function()
-            if not InCombatLockdown() then
-                local ok, savedName = SaveBlizzardSetPreservingIgnoredSlots(targetSetID, changedSlotMap)
-                if ok then
-                    table.insert(updatedNames, savedName)
-                end
-            end
-
-            queueIndex = queueIndex + 1
-            local nextEntry = blizzardNonActiveQueue[queueIndex]
-            if not nextEntry then
-                C_Timer.After(0.2, RestoreOriginalGearStep)
-            else
-                -- Try starting the next set automatically; if blocked by hardware restriction, prompt 1 click
-                EquipBlizzardSetExceptChangedSlots(nextEntry.id, changedSlotMap, newSlotItems)
-                C_Timer.After(0.35, function()
-                    if IsBlizzardSetCurrentlyWornExceptChangedSlots(nextEntry.id, changedSlotMap) then
-                        local ok, savedName = SaveBlizzardSetPreservingIgnoredSlots(nextEntry.id, changedSlotMap)
-                        if ok then
-                            table.insert(updatedNames, savedName)
-                        end
-                        queueIndex = queueIndex + 1
-                        if not blizzardNonActiveQueue[queueIndex] then
-                            C_Timer.After(0.2, RestoreOriginalGearStep)
-                        else
-                            local upcoming = blizzardNonActiveQueue[queueIndex]
-                            ShowHardwareContinuationPrompt(
-                                string.format("Saved %q!\nClick to update next set (%s):", savedName or "Set", upcoming.name),
-                                "Update " .. upcoming.name,
-                                function()
-                                    ExecuteNonActiveSetInHardwareEvent(upcoming)
-                                end,
-                                RestoreOriginalGearStep
-                            )
-                        end
-                    else
-                        ShowHardwareContinuationPrompt(
-                            string.format("Saved %q!\nClick to update next set (%s):", updatedNames[#updatedNames] or "Set", nextEntry.name),
-                            "Update " .. nextEntry.name,
-                            function()
-                                ExecuteNonActiveSetInHardwareEvent(nextEntry)
-                            end,
-                            RestoreOriginalGearStep
-                        )
-                    end
-                end)
-            end
-        end)
+    if #swapQueue == 0 then
+        Finish()
+    else
+        Guard(ProcessNext)()
     end
-
-    -- Kick off the first non-active set SYNCHRONOUSLY inside the current `OnClick` hardware event!
-    queueIndex = 1
-    ExecuteNonActiveSetInHardwareEvent(blizzardNonActiveQueue[1])
 end
 
-local function UpdateSingleSetEntry(entry, changedSlotList, changedSlotMap)
-    if not entry then
-        entry = ResolveActiveSetEntry(nil, changedSlotMap)
+-- Puts gear back after combat interrupted an update.
+local function RunPendingCombatRestore()
+    local snapshot = pendingCombatRestore
+    if not snapshot then
+        return
     end
+    if operationActive then
+        -- The interrupted operation is still winding down; try again shortly.
+        C_Timer.After(1, function()
+            if not InCombatLockdown() then
+                RunPendingCombatRestore()
+            end
+        end)
+        return
+    end
+    pendingCombatRestore = nil
+    if DoesCurrentGearMatchSnapshot(snapshot, true) then
+        return
+    end
+    operationActive = true
+    isInternalOperation = true
+    RestoreGearSnapshot(snapshot)
+    WaitFor(
+        function() return DoesCurrentGearMatchSnapshot(snapshot, true) end,
+        6,
+        function() RestoreGearSnapshot(snapshot) end,
+        function(ok, reason)
+            if reason == "combat" then
+                pendingCombatRestore = snapshot
+            elseif ok then
+                PrintMessage("Restored the gear you were wearing before combat.")
+            else
+                PrintMessage("|cffffd100Could not fully restore your gear|r (" .. ListMismatchedSlots(snapshot) .. "). Re-equip those slots manually.")
+            end
+            FinishOperationState()
+        end
+    )
+end
+
+local function UpdateSingleSetEntry(entry, changedSlotList)
+    entry = entry or ResolveActiveSetEntry(nil, nil)
     if not entry then
         return
     end
-    changedSlotList = changedSlotList or {}
-    changedSlotMap = changedSlotMap or {}
-    RunSlotOnlySetUpdates({ entry }, changedSlotList, changedSlotMap, "single")
+    RunSetUpdates({ entry }, changedSlotList, "single")
 end
 
-local function UpdateAllSetEntries(changedSlotList, changedSlotMap)
+local function UpdateAllSetEntries(changedSlotList)
     local sets = GetAllConfiguredSets()
     if #sets == 0 then
         return
     end
-    changedSlotList = changedSlotList or {}
-    changedSlotMap = changedSlotMap or {}
-    RunSlotOnlySetUpdates(sets, changedSlotList, changedSlotMap, "all")
+    RunSetUpdates(sets, changedSlotList, "all")
 end
 
--- Keep StaticPopupDialogs["GEARSET_UPDATE_PROMPT"] registered for compatibility
-StaticPopupDialogs[POPUP_KEY] = {
-    text = "Equipped new item in %s. Update gear sets?",
-    button1 = "Active Set",
-    button2 = "All Sets",
-    button3 = "Ignore",
-    OnShow = function(self, data)
-        local activeButtonText = "Active Set"
-        if data and data.activeSetName then
-            activeButtonText = string.format("Active Set (%s)", data.activeSetName)
-        end
-        local btn1 = self.button1 or (self.GetButton1 and self:GetButton1())
-        if btn1 then
-            btn1:SetText(activeButtonText)
-        end
-    end,
-    OnAccept = function(self, data)
-        local slots, slotMap = CopyChangedSlotList()
-        ClearPendingSlots()
-        UpdateSingleSetEntry(data and data.activeEntry or nil, slots, slotMap)
-    end,
-    OnCancel = function(self, data, reason)
-        if isRefreshingPopup then
-            return
-        end
-        local slots, slotMap = CopyChangedSlotList()
-        ClearPendingSlots()
-        if reason == "override" or reason == "clicked" then
-            UpdateAllSetEntries(slots, slotMap)
-        end
-    end,
-    OnAlt = function()
-        ClearPendingSlots()
-    end,
-    timeout = 0,
-    whileDead = true,
-    hideOnEscape = true,
-    preferredIndex = 3,
-}
+-- ============================================================================
+-- Update Prompt (set picker dialog)
+-- ============================================================================
 
--- Safe Backdrop helper that works across all Classic / Forever / Retail clients
+-- Backdrop helper that works across Classic / Forever / Retail clients
 local function ApplyDarkBackdrop(frame, isDialog)
     if not frame.SetBackdrop and BackdropTemplateMixin then
         Mixin(frame, BackdropTemplateMixin)
@@ -1058,18 +1198,14 @@ local function ApplyDarkBackdrop(frame, isDialog)
             frame:SetBackdrop({
                 bgFile = "Interface\\DialogFrame\\UI-DialogBox-Background",
                 edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
-                tile = true,
-                tileSize = 32,
-                edgeSize = 32,
+                tile = true, tileSize = 32, edgeSize = 32,
                 insets = { left = 11, right = 12, top = 12, bottom = 11 },
             })
         else
             frame:SetBackdrop({
                 bgFile = "Interface\\ChatFrame\\ChatFrameBackground",
                 edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
-                tile = true,
-                tileSize = 16,
-                edgeSize = 14,
+                tile = true, tileSize = 16, edgeSize = 14,
                 insets = { left = 3, right = 3, top = 3, bottom = 3 },
             })
             frame:SetBackdropColor(0.06, 0.06, 0.06, 0.95)
@@ -1082,8 +1218,17 @@ local function ApplyDarkBackdrop(frame, isDialog)
     end
 end
 
--- Custom Prompt Dialog with Set Selector Dropdown
 local promptFrame = nil
+
+-- keepPending: keep the recorded slots (used when combat hides the prompt so it can
+-- come back afterwards). Any other close, including Escape, discards them.
+local function HidePrompt(keepPending)
+    if promptFrame and promptFrame:IsShown() then
+        promptFrame.keepPending = keepPending
+        promptFrame:Hide()
+        promptFrame.keepPending = nil
+    end
+end
 
 local function GetOrCreatePromptFrame()
     if promptFrame then
@@ -1102,11 +1247,18 @@ local function GetOrCreatePromptFrame()
     f:SetScript("OnDragStart", f.StartMoving)
     f:SetScript("OnDragStop", f.StopMovingOrSizing)
     ApplyDarkBackdrop(f, true)
+    f:SetScript("OnHide", function(self)
+        if self.ddList then
+            self.ddList:Hide()
+        end
+        if not self.keepPending then
+            ClearPendingSlots()
+        end
+    end)
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOP", f, "TOP", 0, -18)
     title:SetText("GearSetHelper")
-    f.title = title
 
     local text = f:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
     text:SetPoint("TOPLEFT", f, "TOPLEFT", 24, -38)
@@ -1118,7 +1270,6 @@ local function GetOrCreatePromptFrame()
     local ddLabel = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
     ddLabel:SetPoint("TOPLEFT", f, "TOPLEFT", 28, -74)
     ddLabel:SetText("Target Set:")
-    f.ddLabel = ddLabel
 
     local ddButton = CreateFrame("Button", nil, f, template)
     ddButton:SetSize(245, 26)
@@ -1164,19 +1315,40 @@ local function GetOrCreatePromptFrame()
     btnUpdateSet:SetSize(115, 24)
     btnUpdateSet:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 22, 18)
     btnUpdateSet:SetText("Update Set")
-    f.btnUpdateSet = btnUpdateSet
+    btnUpdateSet:SetScript("OnClick", function()
+        local selectedEntry = f.selectedEntry
+        local slots = CopyChangedSlotList()
+        local isTest = f.isTest
+        HidePrompt()
+        if isTest then
+            PrintMessage(string.format("Test prompt: would update %q. Nothing was changed.", selectedEntry and selectedEntry.name or "?"))
+            return
+        end
+        UpdateSingleSetEntry(selectedEntry, slots)
+    end)
 
     local btnAllSets = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     btnAllSets:SetSize(105, 24)
     btnAllSets:SetPoint("BOTTOM", f, "BOTTOM", 5, 18)
     btnAllSets:SetText("All Sets")
-    f.btnAllSets = btnAllSets
+    btnAllSets:SetScript("OnClick", function()
+        local slots = CopyChangedSlotList()
+        local isTest = f.isTest
+        HidePrompt()
+        if isTest then
+            PrintMessage("Test prompt: would update all sets. Nothing was changed.")
+            return
+        end
+        UpdateAllSetEntries(slots)
+    end)
 
     local btnIgnore = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
     btnIgnore:SetSize(95, 24)
     btnIgnore:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -22, 18)
     btnIgnore:SetText("Ignore")
-    f.btnIgnore = btnIgnore
+    btnIgnore:SetScript("OnClick", function()
+        HidePrompt()
+    end)
 
     if type(UISpecialFrames) == "table" then
         table.insert(UISpecialFrames, "GearSetHelperPromptFrame")
@@ -1184,94 +1356,6 @@ local function GetOrCreatePromptFrame()
 
     promptFrame = f
     return f
-end
-
-local function ConfigureStandardPromptButtons(f)
-    f.ddLabel:Show()
-    f.ddButton:Show()
-
-    f.btnUpdateSet:SetSize(115, 24)
-    f.btnUpdateSet:ClearAllPoints()
-    f.btnUpdateSet:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 22, 18)
-    f.btnUpdateSet:SetText("Update Set")
-    f.btnUpdateSet:SetScript("OnClick", function()
-        local selectedEntry = f.selectedEntry
-        local slots, slotMap = CopyChangedSlotList()
-        ClearPendingSlots()
-        f.ddList:Hide()
-        f:Hide()
-        UpdateSingleSetEntry(selectedEntry, slots, slotMap)
-    end)
-    f.btnUpdateSet:Show()
-
-    f.btnAllSets:SetSize(105, 24)
-    f.btnAllSets:ClearAllPoints()
-    f.btnAllSets:SetPoint("BOTTOM", f, "BOTTOM", 5, 18)
-    f.btnAllSets:SetText("All Sets")
-    f.btnAllSets:SetScript("OnClick", function()
-        local slots, slotMap = CopyChangedSlotList()
-        ClearPendingSlots()
-        f.ddList:Hide()
-        f:Hide()
-        UpdateAllSetEntries(slots, slotMap)
-    end)
-    f.btnAllSets:Show()
-
-    f.btnIgnore:SetSize(95, 24)
-    f.btnIgnore:ClearAllPoints()
-    f.btnIgnore:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -22, 18)
-    f.btnIgnore:SetText("Ignore")
-    f.btnIgnore:SetScript("OnClick", function()
-        ClearPendingSlots()
-        f.ddList:Hide()
-        f:Hide()
-    end)
-    f.btnIgnore:Show()
-end
-
--- Shown only if the WoW client blocks an automated post-save gear restore/swap inside a timer,
--- giving a 1-click hardware event button to finish restoring or advancing.
-ShowHardwareContinuationPrompt = function(messageText, primaryButtonText, onPrimaryClick, onCancelClick)
-    if InCombatLockdown() then
-        if onCancelClick then
-            onCancelClick()
-        end
-        return
-    end
-
-    local f = GetOrCreatePromptFrame()
-    f.ddList:Hide()
-    f.ddLabel:Hide()
-    f.ddButton:Hide()
-    f.text:SetText(messageText)
-
-    f.btnUpdateSet:SetSize(210, 26)
-    f.btnUpdateSet:ClearAllPoints()
-    f.btnUpdateSet:SetPoint("BOTTOMLEFT", f, "BOTTOMLEFT", 24, 18)
-    f.btnUpdateSet:SetText(primaryButtonText)
-    f.btnUpdateSet:SetScript("OnClick", function()
-        f:Hide()
-        if onPrimaryClick then
-            onPrimaryClick()
-        end
-    end)
-    f.btnUpdateSet:Show()
-
-    f.btnAllSets:Hide()
-
-    f.btnIgnore:SetSize(105, 26)
-    f.btnIgnore:ClearAllPoints()
-    f.btnIgnore:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -24, 18)
-    f.btnIgnore:SetText("Keep Current")
-    f.btnIgnore:SetScript("OnClick", function()
-        f:Hide()
-        if onCancelClick then
-            onCancelClick()
-        end
-    end)
-    f.btnIgnore:Show()
-
-    f:Show()
 end
 
 local function SetPromptDropdownSelection(f, entry, isActive)
@@ -1325,6 +1409,7 @@ local function PopulatePromptDropdown(f, sets, activeEntry)
             f.optionButtons[count] = optBtn
         end
 
+        optBtn:ClearAllPoints()
         optBtn:SetPoint("TOPLEFT", f.ddList, "TOPLEFT", 4, -4 - (count - 1) * rowHeight)
         optBtn:SetPoint("TOPRIGHT", f.ddList, "TOPRIGHT", -4, -4 - (count - 1) * rowHeight)
         optBtn.icon:SetTexture(entry.icon or 134400)
@@ -1334,8 +1419,7 @@ local function PopulatePromptDropdown(f, sets, activeEntry)
             optBtn.label:SetText(entry.name)
         end
 
-        local capturedEntry = entry
-        local capturedActive = isActive
+        local capturedEntry, capturedActive = entry, isActive
         optBtn:SetScript("OnClick", function()
             SetPromptDropdownSelection(f, capturedEntry, capturedActive)
             f.ddList:Hide()
@@ -1349,19 +1433,22 @@ local function PopulatePromptDropdown(f, sets, activeEntry)
     end
 end
 
-local function HideUpdatePromptForCombat()
-    if promptFrame and promptFrame:IsShown() then
-        promptFrame.ddList:Hide()
-        promptFrame:Hide()
-        return true
+-- Drops pending slots whose newly equipped item is already saved in some set.
+local function FilterKnownItemSlots(sets)
+    local remaining = {}
+    for _, slotID in ipairs(pendingSlotOrder) do
+        local itemID = GetInventoryItemID("player", slotID)
+        if not (itemID and IsItemInAnySet(itemID, sets)) then
+            table.insert(remaining, slotID)
+        end
     end
-    if StaticPopup_Visible(POPUP_KEY) then
-        isRefreshingPopup = true
-        StaticPopup_Hide(POPUP_KEY)
-        isRefreshingPopup = false
-        return true
+    if #remaining ~= #pendingSlotOrder then
+        ClearPendingSlots()
+        for _, slotID in ipairs(remaining) do
+            RecordChangedSlot(slotID)
+        end
     end
-    return false
+    return #remaining > 0
 end
 
 local function ShowUpdatePrompt(isTest)
@@ -1375,27 +1462,58 @@ local function ShowUpdatePrompt(isTest)
         queuedForCombat = true
         return
     end
+    queuedForCombat = false
+
+    if not isTest then
+        -- Several slots changing at once is a set swap (ItemRack, Outfitter, or a
+        -- macro), not a new item.
+        if #pendingSlotOrder >= SET_SWAP_SLOT_THRESHOLD then
+            ClearPendingSlots()
+            return
+        end
+        -- Only slots that still hold an item count; unequipping is not a new item.
+        local filled = {}
+        for _, slotID in ipairs(pendingSlotOrder) do
+            if GetInventoryItemID("player", slotID) ~= nil then
+                table.insert(filled, slotID)
+            end
+        end
+        ClearPendingSlots()
+        for _, slotID in ipairs(filled) do
+            RecordChangedSlot(slotID)
+        end
+        if #filled == 0 then
+            return
+        end
+    end
 
     local sets = GetAllConfiguredSets()
     if #sets == 0 then
         local slotSummary = FormatChangedSlots()
         ClearPendingSlots()
-        queuedForCombat = false
         PrintMessage(string.format(
-            "Equipped new item in %s, but 0 equipment sets were detected. Create a set first or run |cffffd100/gsh create <SetName>|r.",
+            "Equipped new item in %s, but no equipment sets were found. Create a set first or run |cffffd100/gsh create <SetName>|r.",
             slotSummary
         ))
         return
     end
 
+    if not isTest and GetSetting("skipKnownItems") and not FilterKnownItemSlots(sets) then
+        ClearPendingSlots()
+        return
+    end
+
     local slotSummary = FormatChangedSlots()
     local _, changedSlotMap = CopyChangedSlotList()
-    queuedForCombat = false
-
     local activeEntry = ResolveActiveSetEntry(sets, changedSlotMap)
+
     local f = GetOrCreatePromptFrame()
-    ConfigureStandardPromptButtons(f)
-    f.text:SetText(string.format("Equipped new item in |cffffd100%s|r.\nUpdate only that slot in your gear sets?", slotSummary))
+    f.isTest = isTest and true or false
+    if isTest then
+        f.text:SetText(string.format("|cff888888[Test - buttons won't change anything]|r\nEquipped new item in |cffffd100%s|r.", slotSummary))
+    else
+        f.text:SetText(string.format("Equipped new item in |cffffd100%s|r.\nUpdate only that slot in your gear sets?", slotSummary))
+    end
     PopulatePromptDropdown(f, sets, activeEntry)
     f.ddList:Hide()
     f:Show()
@@ -1404,18 +1522,185 @@ end
 local function ScheduleDebouncedPrompt()
     if debounceTimer then
         debounceTimer:Cancel()
-        debounceTimer = nil
     end
-
     debounceTimer = C_Timer.NewTimer(DEBOUNCE_DELAY, function()
         debounceTimer = nil
         ShowUpdatePrompt(false)
     end)
 end
 
--- Event frame setup
+-- ============================================================================
+-- Enable / disable (slash command, key binding, settings panel)
+-- ============================================================================
+
+local RefreshOptionsPanel -- defined with the settings panel below
+
+local function SetEnabled(value)
+    InitDB()
+    GearSetHelperDB.enabled = value and true or false
+    if not GearSetHelperDB.enabled then
+        if debounceTimer then
+            debounceTimer:Cancel()
+            debounceTimer = nil
+        end
+        ClearPendingSlots()
+        queuedForCombat = false
+        HidePrompt()
+    end
+    local stateText = GearSetHelperDB.enabled and "|cff00ff00enabled|r" or "|cffff4444disabled|r"
+    PrintMessage("Update prompts " .. stateText .. ".")
+    if RefreshOptionsPanel then
+        RefreshOptionsPanel()
+    end
+end
+
+-- Global so Bindings.xml can call it.
+function GearSetHelper_Toggle()
+    SetEnabled(not IsEnabled())
+end
+
+-- ============================================================================
+-- Settings panel (Options -> AddOns -> GearSetHelper)
+-- ============================================================================
+
+local optionsPanel, optionsCategory
+local optionCheckboxes = {}
+
+RefreshOptionsPanel = function()
+    for key, cb in pairs(optionCheckboxes) do
+        cb:SetChecked(GetSetting(key) and true or false)
+    end
+    if optionsPanel and optionsPanel.bindingText then
+        local key = GetBindingKey and GetBindingKey("GEARSETHELPER_TOGGLE")
+        if key then
+            optionsPanel.bindingText:SetText("Toggle key: |cffffd100" .. key .. "|r  (change it in Key Bindings > AddOns > GearSetHelper)")
+        else
+            optionsPanel.bindingText:SetText("Toggle key: |cff888888not bound|r  (set one in Key Bindings > AddOns > GearSetHelper)")
+        end
+    end
+end
+
+local function CreateOptionCheckbox(parent, anchor, key, label, description, onChange)
+    local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+    cb:SetSize(26, 26)
+    cb:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -14)
+
+    local labelText = cb.text or cb.Text
+    if not labelText then
+        labelText = cb:CreateFontString(nil, "ARTWORK", "GameFontHighlight")
+    end
+    labelText:SetFontObject("GameFontHighlight")
+    labelText:ClearAllPoints()
+    labelText:SetPoint("LEFT", cb, "RIGHT", 4, 1)
+    labelText:SetText(label)
+
+    local desc = parent:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    desc:SetPoint("TOPLEFT", cb, "BOTTOMLEFT", 30, 2)
+    desc:SetWidth(540)
+    desc:SetJustifyH("LEFT")
+    desc:SetTextColor(0.75, 0.75, 0.75)
+    desc:SetText(description)
+
+    cb:SetScript("OnClick", function(self)
+        local value = self:GetChecked() and true or false
+        if onChange then
+            onChange(value)
+        else
+            InitDB()
+            GearSetHelperDB[key] = value
+        end
+    end)
+
+    optionCheckboxes[key] = cb
+    return desc
+end
+
+local function CreateOptionsPanel()
+    if optionsPanel then
+        return
+    end
+
+    local panel = CreateFrame("Frame", "GearSetHelperOptionsPanel", UIParent)
+    panel.name = "GearSetHelper"
+    panel:Hide()
+
+    local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+    title:SetPoint("TOPLEFT", panel, "TOPLEFT", 16, -16)
+    title:SetText("GearSetHelper |cff888888v" .. ADDON_VERSION .. "|r")
+
+    local subtitle = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    subtitle:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+    subtitle:SetWidth(560)
+    subtitle:SetJustifyH("LEFT")
+    subtitle:SetText("Offers to update your equipment sets when you equip a new item.")
+
+    local anchor = CreateOptionCheckbox(panel, subtitle, "enabled",
+        "Enable update prompts",
+        "Show the set picker when you equip a new item. Also toggled with /gsh toggle or the key binding below.",
+        function(value) SetEnabled(value) end)
+
+    anchor = CreateOptionCheckbox(panel, anchor, "skipKnownItems",
+        "Don't prompt for items already in a set",
+        "Skip the prompt when the item you equipped is already saved in any of your sets, e.g. when swapping gear by hand.")
+
+    anchor = CreateOptionCheckbox(panel, anchor, "showLoadMessage",
+        "Show login message",
+        "Print the \"Loaded\" line in chat when you log in.")
+
+    local bindingText = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+    bindingText:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", -30, -20)
+    bindingText:SetJustifyH("LEFT")
+    panel.bindingText = bindingText
+
+    local testButton = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+    testButton:SetSize(140, 24)
+    testButton:SetPoint("TOPLEFT", bindingText, "BOTTOMLEFT", 0, -16)
+    testButton:SetText("Show test prompt")
+    testButton:SetScript("OnClick", function()
+        ClearPendingSlots()
+        RecordChangedSlot(SLOT_FINGER1)
+        ShowUpdatePrompt(true)
+    end)
+
+    panel:SetScript("OnShow", RefreshOptionsPanel)
+
+    if Settings and Settings.RegisterCanvasLayoutCategory and Settings.RegisterAddOnCategory then
+        optionsCategory = Settings.RegisterCanvasLayoutCategory(panel, panel.name)
+        Settings.RegisterAddOnCategory(optionsCategory)
+    elseif InterfaceOptions_AddCategory then
+        InterfaceOptions_AddCategory(panel)
+    end
+
+    optionsPanel = panel
+end
+
+local function OpenOptionsPanel()
+    if InCombatLockdown() then
+        PrintMessage("Settings can't be opened in combat.")
+        return
+    end
+    if optionsCategory and Settings and Settings.OpenToCategory then
+        local id = (optionsCategory.GetID and optionsCategory:GetID()) or optionsCategory.ID
+        -- Settings.OpenToCategory is an alias of C_SettingsUtil.OpenSettingsPanel on 12.x.
+        local ok = pcall(Settings.OpenToCategory, id)
+        if not ok and C_SettingsUtil and C_SettingsUtil.OpenSettingsPanel then
+            pcall(C_SettingsUtil.OpenSettingsPanel, id)
+        end
+    elseif optionsPanel and InterfaceOptionsFrame_OpenToCategory then
+        -- Called twice: the first call can land on the wrong page on older clients.
+        InterfaceOptionsFrame_OpenToCategory(optionsPanel)
+        InterfaceOptionsFrame_OpenToCategory(optionsPanel)
+    else
+        PrintMessage("Open Options > AddOns > GearSetHelper.")
+    end
+end
+
+-- ============================================================================
+-- Events
+-- ============================================================================
+
 local eventFrame = CreateFrame("Frame", "GearSetHelperFrame")
-local EVENTS_TO_REGISTER = {
+for _, ev in ipairs({
     "ADDON_LOADED",
     "PLAYER_ENTERING_WORLD",
     "PLAYER_EQUIPMENT_CHANGED",
@@ -1424,19 +1709,15 @@ local EVENTS_TO_REGISTER = {
     "EQUIPMENT_SETS_CHANGED",
     "PLAYER_REGEN_DISABLED",
     "PLAYER_REGEN_ENABLED",
-}
-for _, ev in ipairs(EVENTS_TO_REGISTER) do
+}) do
     pcall(eventFrame.RegisterEvent, eventFrame, ev)
 end
 
 eventFrame:SetScript("OnEvent", function(self, event, ...)
     if event == "ADDON_LOADED" then
-        local loadedAddon = ...
-        if loadedAddon == addonName then
-            GearSetHelperDB = GearSetHelperDB or {}
-            if GearSetHelperDB.enabled == nil then
-                GearSetHelperDB.enabled = true
-            end
+        if ... == addonName then
+            InitDB()
+            CreateOptionsPanel()
         end
 
     elseif event == "PLAYER_ENTERING_WORLD" then
@@ -1446,8 +1727,12 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         RefreshLastActiveSet()
         if not hasPrintedLoadMessage then
             hasPrintedLoadMessage = true
-            local sets = GetAllConfiguredSets()
-            PrintMessage(string.format("Loaded v1.0.5 (%d %s detected). Type |cffffd100/gsh|r for commands.", #sets, #sets == 1 and "set" or "sets"))
+            if GetSetting("showLoadMessage") then
+                local sets = GetAllConfiguredSets()
+                local state = IsEnabled() and "" or " |cffff4444(prompts disabled)|r"
+                PrintMessage(string.format("Loaded v%s (%d %s detected)%s. Type |cffffd100/gsh|r for commands.",
+                    ADDON_VERSION, #sets, #sets == 1 and "set" or "sets", state))
+            end
         end
 
     elseif event == "EQUIPMENT_SWAP_PENDING" then
@@ -1459,22 +1744,24 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             debounceTimer:Cancel()
             debounceTimer = nil
         end
+        -- A prompt left open across a set swap would describe gear that is no longer worn.
+        HidePrompt()
         ClearPendingSlots()
 
     elseif event == "EQUIPMENT_SWAP_FINISHED" then
-        local completed, setID = ...
+        -- Always clear the swap flag, even mid-operation, so it can never get stuck on.
+        C_Timer.After(0.1, function()
+            isSwappingSet = false
+        end)
         if isInternalOperation then
             return
         end
-
+        local completed, setID = ...
         if completed and setID ~= nil then
             lastActiveSetKey = "blizzard:" .. tostring(setID)
         else
             RefreshLastActiveSet()
         end
-        C_Timer.After(0.1, function()
-            isSwappingSet = false
-        end)
 
     elseif event == "EQUIPMENT_SETS_CHANGED" then
         if not isInternalOperation then
@@ -1482,12 +1769,15 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
         end
 
     elseif event == "PLAYER_EQUIPMENT_CHANGED" then
-        local equipmentSlot, hasCurrent = ...
-        local slotHasItem = (hasCurrent == true) or (hasCurrent == 1) or (GetInventoryItemID("player", equipmentSlot) ~= nil)
-        if not IsEnabled() or isSwappingSet or isInternalOperation or not slotHasItem then
+        -- The second payload (hasCurrent) has meant opposite things across client
+        -- versions, so check the slot directly instead.
+        local equipmentSlot = ...
+        if not IsEnabled() or isSwappingSet or isInternalOperation then
             return
         end
-
+        if not equipmentSlot or GetInventoryItemID("player", equipmentSlot) == nil then
+            return
+        end
         RecordChangedSlot(equipmentSlot)
         ScheduleDebouncedPrompt()
 
@@ -1497,45 +1787,60 @@ eventFrame:SetScript("OnEvent", function(self, event, ...)
             debounceTimer = nil
             queuedForCombat = true
         end
-        if HideUpdatePromptForCombat() then
+        if promptFrame and promptFrame:IsShown() then
+            HidePrompt(true)
             queuedForCombat = true
         end
 
     elseif event == "PLAYER_REGEN_ENABLED" then
-        if queuedForCombat then
+        if pendingCombatRestore then
+            ClearPendingSlots()
+            queuedForCombat = false
+            RunPendingCombatRestore()
+        elseif queuedForCombat then
             ShowUpdatePrompt(false)
         end
     end
 end)
 
--- Slash command registration (/gsh and /gearsethelper)
+-- ============================================================================
+-- Slash commands (/gsh and /gearsethelper)
+-- ============================================================================
+
 SLASH_GEARSETHELPER1 = "/gsh"
 SLASH_GEARSETHELPER2 = "/gearsethelper"
 
 SlashCmdList["GEARSETHELPER"] = function(msg)
-    GearSetHelperDB = GearSetHelperDB or { enabled = true }
+    InitDB()
 
     local raw = string.match(msg or "", "^%s*(.-)%s*$") or ""
     local command, rest = string.match(raw, "^(%S+)%s*(.-)$")
     command = string.lower(command or "")
 
     if command == "toggle" then
-        GearSetHelperDB.enabled = not IsEnabled()
-        local stateText = GearSetHelperDB.enabled and "|cff00ff00Enabled|r" or "|cffff4444Disabled|r"
-        PrintMessage("Equipment set update prompts are now " .. stateText .. ".")
+        GearSetHelper_Toggle()
+
+    elseif command == "on" or command == "enable" then
+        SetEnabled(true)
+
+    elseif command == "off" or command == "disable" then
+        SetEnabled(false)
+
+    elseif command == "config" or command == "options" or command == "settings" then
+        OpenOptionsPanel()
 
     elseif command == "status" then
         local stateText = IsEnabled() and "|cff00ff00Enabled|r" or "|cffff4444Disabled|r"
         local sets = GetAllConfiguredSets()
         local activeEntry = ResolveActiveSetEntry(sets)
         PrintMessage(string.format(
-            "Status: %s | Configured sets: %d | Active set: %s",
-            stateText,
-            #sets,
-            activeEntry and activeEntry.name or "None"
+            "Status: %s | Sets: %d | Active set: %s | Skip items already in a set: %s",
+            stateText, #sets, activeEntry and activeEntry.name or "None",
+            GetSetting("skipKnownItems") and "on" or "off"
         ))
 
     elseif command == "test" then
+        ClearPendingSlots()
         RecordChangedSlot(SLOT_FINGER1)
         ShowUpdatePrompt(true)
 
@@ -1549,9 +1854,10 @@ SlashCmdList["GEARSETHELPER"] = function(msg)
 
     else
         PrintMessage("Commands:")
-        PrintMessage("  |cffffd100/gsh toggle|r - Enable or disable equipment set update prompts.")
-        PrintMessage("  |cffffd100/gsh status|r - Show current addon status and detected sets.")
-        PrintMessage("  |cffffd100/gsh test|r - Open a test update prompt immediately.")
-        PrintMessage("  |cffffd100/gsh create <Name>|r - Create a new equipment set from current gear.")
+        PrintMessage("  |cffffd100/gsh toggle|r - Turn update prompts on or off (also /gsh on, /gsh off).")
+        PrintMessage("  |cffffd100/gsh config|r - Open the settings panel.")
+        PrintMessage("  |cffffd100/gsh status|r - Show addon status and detected sets.")
+        PrintMessage("  |cffffd100/gsh test|r - Open a test update prompt.")
+        PrintMessage("  |cffffd100/gsh create <Name>|r - Create an equipment set from your current gear.")
     end
 end

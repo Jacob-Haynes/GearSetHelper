@@ -1,0 +1,5 @@
+<Bindings>
+	<Binding name="GEARSETHELPER_TOGGLE" header="GEARSETHELPER" category="ADDONS">
+		GearSetHelper_Toggle()
+	</Binding>
+</Bindings>
